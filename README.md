@@ -19,6 +19,7 @@ This project contains a SystemVerilog/UVM testbench for verifying an AXI FIFO sl
   - Write data (`W`)
   - Write response (`B`)
   - Read address (`AR`)
+ 
   - Read data (`R`)
 - Active/passive UVM agent configuration
 - Write and read monitors connected to scoreboard analysis FIFOs
