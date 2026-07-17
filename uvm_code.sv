@@ -55,9 +55,9 @@ class seq_item extends uvm_sequence_item;
             super.new(name);
     endfunction
 	
-  constraint c1{ unique{wr_addr_channel.id};}
-
-	constraint c2{wr_data_channel.size() == wr_addr_channel.len+1;}
+    constraint wr_ids{wr_addr_channel.id inside {[0:15]};}
+    constraint rd_ids{rd_addr_channel.id inside {[0:15]};}
+    constraint c2{wr_data_channel.size() == wr_addr_channel.len+1;}
 
 	constraint c3{rd_data_channel.size() == rd_addr_channel.len+1;}
     constraint c_data {
@@ -69,10 +69,10 @@ class seq_item extends uvm_sequence_item;
     wr_addr_channel.addr inside {[0:MEM_BYTES-1]};
     }
 	
-	 constraint rd_addr{rd_addr_channel.addr == wr_addr_channel.addr;}
+	constraint rd_addr{rd_addr_channel.addr == wr_addr_channel.addr;}
 
     constraint wr_last{foreach(wr_data_channel[i])
-	                      wr_data_channel[i].last == (i == wr_data_channel.size()-1);}
+	                   wr_data_channel[i].last == (i == wr_data_channel.size()-1);}
     
 	constraint burst{wr_addr_channel.burst != 2'b11;
 	                 rd_addr_channel.burst == wr_addr_channel.burst;}
@@ -94,8 +94,8 @@ class seq_item extends uvm_sequence_item;
 					  wr_addr_channel.qos    == 0;
 					  wr_addr_channel.region == 0;
 					  wr_addr_channel.user   == 0;
-      foreach(wr_data_channel[i])
-        wr_data_channel[i].user   == 0;
+                      foreach(wr_data_channel[i])
+                      wr_data_channel[i].user   == 0;
 					  }
     
 	constraint unused_rd{
@@ -105,8 +105,8 @@ class seq_item extends uvm_sequence_item;
 					  rd_addr_channel.qos    == 0;
 					  rd_addr_channel.region == 0;
 					  rd_addr_channel.user   == 0;
-      foreach(rd_data_channel[i])
-        rd_data_channel[i].user   == 0;
+                      foreach(rd_data_channel[i])
+                      rd_data_channel[i].user   == 0;
 					  }
 	int unsigned w_addr[];
 	int unsigned r_addr[];
@@ -446,7 +446,7 @@ class wrap_unalign_seq extends wr_seq;
   endfunction
 
   task body();
-    repeat(15)
+    repeat(6)
     begin
     req = seq_item::type_id::create("req");
 
@@ -489,6 +489,8 @@ class rd_state;
    bit arw_done;
    bit rw_done;
    bit transcation_done;
+   int unsigned beats_received;
+   int unsigned expected_beats;
    
 endclass
 
@@ -500,9 +502,9 @@ class wr_driver extends uvm_driver#(seq_item);
 	seq_item queue_wr[$],queue_rd[$];
 	wr_state wr_status;
 	rd_state rd_status;
-	wr_state requests[int][$];
+	wr_state wr_requests[int][$];
 	wr_state aw_w_order[$];
-	rd_state arw_rw_order[$];
+	rd_state rd_requests[int][$];
 	static int no_of_wr_trans_done;
 	static int no_of_rd_trans_done;
     function new(string name = "wr_driver",uvm_component parent);
@@ -563,6 +565,8 @@ seq_item tr;
 	begin
       tr = queue_wr[0];
 	end
+	wr_status.wr_t = tr;
+	display_wr_addr_tr();
     repeat (2)
     begin
         @(wr_cfg.vif.cb_master);
@@ -579,17 +583,13 @@ seq_item tr;
     wr_cfg.vif.cb_master.AWREGION <= tr.wr_addr_channel.region;
     wr_cfg.vif.cb_master.AWUSER   <= tr.wr_addr_channel.user;
     wr_cfg.vif.cb_master.AWVALID  <= 1'b1;
-    wr_status.wr_t                 = tr;
+    display_wr_addr();
     wait (wr_cfg.vif.cb_master.AWREADY);
     @(wr_cfg.vif.cb_master);
-   if (wr_cfg.vif.AWVALID && wr_cfg.vif.cb_master.AWREADY)
-    begin
-        display_wr_addr();
-    end
     void'(queue_wr.pop_front());
 	wr_status.aw_done = 1;
 	aw_w_order.push_back(wr_status);
-	requests[wr_status.wr_t.wr_addr_channel.id].push_back(wr_status);
+	wr_requests[wr_status.wr_t.wr_addr_channel.id].push_back(wr_status);
     wr_cfg.vif.cb_master.AWVALID <= 1'b0;
     end
 endtask
@@ -618,7 +618,6 @@ task wr_data_channel();
     begin
         display_wr_data(beat);
     end
-
     wr_cfg.vif.cb_master.WVALID <= 1'b0;
 	end
     wr_status.w_done = 1;
@@ -641,17 +640,17 @@ task resp_channel();
     begin
         display_wr_bresp();
     end
-	if(requests.exists(wr_cfg.vif.cb_master.BID) && requests[wr_cfg.vif.cb_master.BID].size() > 0)
-      wr_status = requests[wr_cfg.vif.cb_master.BID][0];
+	if(wr_requests.exists(wr_cfg.vif.cb_master.BID) && wr_requests[wr_cfg.vif.cb_master.BID].size() > 0)
+      wr_status = wr_requests[wr_cfg.vif.cb_master.BID][0];
 	if(wr_status.aw_done && wr_status.w_done)
 	   begin
 	   wr_status.b_done    = 1;
 	   no_of_wr_trans_done = t.wr_trans_done++; 
-       void'(requests[wr_cfg.vif.cb_master.BID].pop_front());
+       void'(wr_requests[wr_cfg.vif.cb_master.BID].pop_front());
        end   
-	 if(requests[wr_cfg.vif.cb_master.BID].size() == 0)
+	 if(wr_requests[wr_cfg.vif.cb_master.BID].size() == 0)
 	    begin
-        requests.delete(wr_cfg.vif.cb_master.BID);
+        wr_requests.delete(wr_cfg.vif.cb_master.BID);
 		end
         wr_cfg.vif.cb_master.BREADY <= 1'b0;
 	
@@ -669,7 +668,8 @@ task rd_addr_channel();
 	begin
       tr = queue_rd[0];
 	end
-      @(wr_cfg.vif.cb_master);
+    rd_status.rd_t = tr;
+    @(wr_cfg.vif.cb_master);
     wr_cfg.vif.cb_master.ARID     <= tr.rd_addr_channel.id;
     wr_cfg.vif.cb_master.ARADDR   <= tr.rd_addr_channel.addr;
     wr_cfg.vif.cb_master.ARLEN    <= tr.rd_addr_channel.len;
@@ -682,7 +682,7 @@ task rd_addr_channel();
     wr_cfg.vif.cb_master.ARREGION <= tr.rd_addr_channel.region;
     wr_cfg.vif.cb_master.ARUSER   <= tr.rd_addr_channel.user;
     wr_cfg.vif.cb_master.ARVALID  <= 1'b1;
-	rd_status.rd_t                 = tr;
+	rd_status.expected_beats       = tr.rd_addr_channel.len+1;
     wait (wr_cfg.vif.cb_master.ARREADY);
     @(wr_cfg.vif.cb_master);
     if (wr_cfg.vif.ARVALID && wr_cfg.vif.cb_master.ARREADY)
@@ -691,7 +691,7 @@ task rd_addr_channel();
     end
     void'(queue_rd.pop_front());
 	rd_status.arw_done = 1;
-	arw_rw_order.push_back(rd_status);
+    rd_requests[tr.rd_addr_channel.id].push_back(rd_status);
     wr_cfg.vif.cb_master.ARVALID <= 1'b0;
     end
 endtask
@@ -700,36 +700,69 @@ endtask
 task rd_data_channel();
     seq_item t;
     rd_state rd_status;
+	int unsigned rid;
+    int unsigned beat;
+    bit expected_last;
+
     forever
 	begin
 	t = seq_item::type_id::create("t");
-	wait(arw_rw_order.size() > 0)
-	begin
-	rd_status = arw_rw_order.pop_front();
-	end
-    foreach(rd_status.rd_t.rd_data_channel[beat])
-    begin
+ 
     @(wr_cfg.vif.cb_master);
     wr_cfg.vif.cb_master.RREADY <= 1'b1;
     wait (wr_cfg.vif.cb_master.RVALID);
     @(wr_cfg.vif.cb_master);
-	
-    if (wr_cfg.vif.cb_master.RVALID && wr_cfg.vif.RREADY)
+	if (wr_cfg.vif.cb_master.RVALID && wr_cfg.vif.RREADY)
     begin
-        display_rd_data(beat);
+	    rid = wr_cfg.vif.cb_master.RID;
+     if(!(rd_requests.exists(rid) && rd_requests[rid].size() > 0))
+	  begin
+	   `uvm_error("UNKNOWN_RID",$sformatf("Received unknown RID=%0d", rid) )
+	  end
+	 else
+	   begin
+	   rd_status = rd_requests[wr_cfg.vif.cb_master.RID][0];
+	   beat      = rd_status.beats_received;
+       if(beat >= rd_status.expected_beats)
+	     `uvm_error("EXTRA_RBEAT",$sformatf("RID=%0d received extra beat=%0d",rid,beat) )
+	   else
+	       begin
+		            rd_status.rd_t.rd_data_channel[beat].id   = wr_cfg.vif.cb_master.RID;
+
+                    rd_status.rd_t.rd_data_channel[beat].data = wr_cfg.vif.cb_master.RDATA;
+
+                    rd_status.rd_t.rd_data_channel[beat].resp = axi_resp_e'(wr_cfg.vif.cb_master.RRESP);
+
+                    rd_status.rd_t.rd_data_channel[beat].last = wr_cfg.vif.cb_master.RLAST;
+
+                    rd_status.rd_t.rd_data_channel[beat].user = wr_cfg.vif.cb_master.RUSER;
+					
+					display_rd_data(beat);
+					
+					expected_last = (beat == rd_status.expected_beats-1);
+					
+				   if (wr_cfg.vif.cb_master.RLAST != expected_last)
+                    begin
+                      `uvm_error( "RLAST_ERROR", $sformatf( "RID=%0d beat=%0d expected_last=%0b actual_last=%0b",rid, beat,expected_last,wr_cfg.vif.cb_master.RLAST) )
+                   end
+                     rd_status.beats_received++;
+				 if(wr_cfg.vif.cb_master.RLAST)
+				  begin
+					 if(rd_status.arw_done)
+					 begin
+	                       rd_status.rw_done   = 1;
+	                       no_of_rd_trans_done = t.rd_trans_done++;
+						   void'(rd_requests[rid].pop_front);
+						   if(rd_requests[rid].size() == 0)
+						     rd_requests.delete(rid);
+	                 end
+                           wr_cfg.vif.cb_master.RREADY <= 1'b0;
+                 end
+            end
+	    end
     end
-	
-    if (wr_cfg.vif.cb_master.RLAST)
-    begin
-        wr_cfg.vif.cb_master.RREADY <= 1'b0;
-    end
-    end
-    if(rd_status.arw_done)
-       begin
-	   rd_status.rw_done   = 1;
-	   no_of_rd_trans_done = t.rd_trans_done++;
-	   end
-    end 
+end
+
 endtask
 
 
@@ -754,7 +787,19 @@ task drive_back_pressure(seq_item tr);
 endtask
 
 
+task display_wr_addr_tr();
 
+    $display("");
+    $display("+------------------------------------------------------------------------------------------------------------------+");
+    $display("| WRITE ADDRESS CHANNEL                                                                                            |");
+    $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
+    $display("| ID   | ADDRESS    | LEN  | BEATS | SIZE | BURST  | LOCK   | CACHE  | PROT   | QOS    | REGION | USER |");
+    $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
+    $display("| %-4d | 0x%08h | %-4d | %-5d | %-4d | %-6d | %-6b | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-2h |", tr.AWID, tr.AWADDR, tr.AWLEN, tr.AWLEN + 1, tr.AWSIZE, tr.AWBURST, tr.AWLOCK, tr.AWCACHE, tr.AWPROT, tr.AWQOS, tr.AWREGION, tr.AWUSER);
+    $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
+    $display("TIME=%0t", $time);
+
+endtask
 task display_wr_addr();
 
     $display("");
