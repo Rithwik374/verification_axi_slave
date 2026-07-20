@@ -5,7 +5,11 @@
 package pkg;
 import uvm_pkg::*;
 import axi_fifo_slave_pkg::*;
+
 `include "uvm_macros.svh"
+
+ typedef enum{ NORMAL_RW , RD_AFT_WR } operation_e;
+ 
 class wr_config extends uvm_object;
     `uvm_object_utils(wr_config)
 	virtual axi_fifo_slave_if vif;
@@ -51,6 +55,10 @@ class seq_item extends uvm_sequence_item;
 	rand axi_rbeat_t rd_data_channel[];
 	static int wr_trans_done = 0;
 	static int rd_trans_done = 0;
+  
+    
+    rand operation_e operation = NORMAL_RW;
+  
     function new(string name = "seq_item");
             super.new(name);
     endfunction
@@ -66,26 +74,27 @@ class seq_item extends uvm_sequence_item;
     }
 }
     constraint c_addr{
-    wr_addr_channel.addr inside {[0:MEM_BYTES-1]};
+      wr_addr_channel.addr inside {[0:MEM_BYTES-1]};
     }
+
 	
-	constraint rd_addr{rd_addr_channel.addr == wr_addr_channel.addr;}
+      constraint rd_addr{rd_addr_channel.addr inside {[0:MEM_BYTES-1]};}
 
     constraint wr_last{foreach(wr_data_channel[i])
 	                   wr_data_channel[i].last == (i == wr_data_channel.size()-1);}
     
 	constraint burst{wr_addr_channel.burst != 2'b11;
-	                 rd_addr_channel.burst == wr_addr_channel.burst;}
+	                 rd_addr_channel.burst != 2'b11;}
 					 
 	constraint len{wr_addr_channel.len inside {[1:15]};
-	               rd_addr_channel.len == wr_addr_channel.len;}
+	               rd_addr_channel.len inside {[1:15]};}
 	
 	constraint bur_len{wr_addr_channel.burst == 2 -> wr_addr_channel.len inside {1,3,7,15};
                    	   rd_addr_channel.burst == 2 -> rd_addr_channel.len inside {1,3,7,15};
 					  }
 	
     constraint size{wr_addr_channel.size inside {0,1,2};
-	                rd_addr_channel.size == wr_addr_channel.size;}
+	                rd_addr_channel.size inside {0,1,2};}
 	
 	constraint unused_wr{
 	                  wr_addr_channel.lock   == 0;
@@ -108,20 +117,20 @@ class seq_item extends uvm_sequence_item;
                       foreach(rd_data_channel[i])
                       rd_data_channel[i].user   == 0;
 					  }
-	int unsigned w_addr[];
-	int unsigned r_addr[];
-	
+	int    unsigned    w_addr[];
+	int    unsigned    r_addr[];
+   
 	
 	
 	function void post_randomize();
-
+    
     wr_addr_calc();
 
     rd_addr_calc();
 
     strobe_calc();
 
-
+    
    endfunction
 	
 	function void wr_addr_calc();
@@ -452,16 +461,56 @@ class wrap_unalign_seq extends wr_seq;
 
     start_item(req);
 
-  /*  assert(req.randomize() with {wr_addr_channel.burst == 2;
+    assert(req.randomize() with {wr_addr_channel.burst == 2;
                                  wr_addr_channel.len   == 15;
 								 wr_addr_channel.size  == 2;
-								// wr_addr_channel.addr  == 5943;
-								});*/
-      assert(req.randomize());
+								 wr_addr_channel.addr  == 5943;
+								 operation == RD_AFT_WR;
+								});
       
 	finish_item(req);
     end
   endtask
+  
+  class rd_Aft_wr_seq extends uvm_sequence #(seq_item);
+
+    `uvm_object_utils(rd_Aft_wr_seq)
+
+    seq_item req;
+
+    function new(string name = "rd_Aft_wr_seq");
+        super.new(name);
+    endfunction
+
+    task body();
+
+        repeat (6)
+        begin
+            req = seq_item::type_id::create("req");
+
+            start_item(req);
+
+            if (!req.randomize() with {
+                rd_addr_channel.addr == wr_addr_channel.addr;
+                rd_addr_channel.len == wr_addr_channel.len;
+                rd_addr_channel.size == wr_addr_channel.size;
+                rd_addr_channel.burst == wr_addr_channel.burst;
+				operation = RD_AFT_WR;
+            })
+            begin
+                `uvm_error("RD_AFT_WR_SEQ", "Randomization failed")
+            end
+
+
+
+            `uvm_info("RD_AFT_WR_SEQ", $sformatf("AWID=%0d ARID=%0d AWADDR=%08h ARADDR=%08h LEN=%0d SIZE=%0d BURST=%0d OP=%0d", req.wr_addr_channel.id, req.rd_addr_channel.id, req.wr_addr_channel.addr, req.rd_addr_channel.addr, req.wr_addr_channel.len, req.wr_addr_channel.size, req.wr_addr_channel.burst, req.operation), UVM_MEDIUM)
+
+            finish_item(req);
+        end
+
+    endtask
+
+endclass
 
 endclass
 
@@ -498,13 +547,14 @@ endclass
 class wr_driver extends uvm_driver#(seq_item);
   `uvm_component_utils(wr_driver)
     wr_config wr_cfg;
-	seq_item req;
+	seq_item req,tr1;
 	seq_item queue_wr[$],queue_rd[$];
 	wr_state wr_status;
 	rd_state rd_status;
 	wr_state wr_requests[int][$];
 	wr_state aw_w_order[$];
 	rd_state rd_requests[int][$];
+    seq_item pending_rd_after_b[int][$];
 	static int no_of_wr_trans_done;
 	static int no_of_rd_trans_done;
     function new(string name = "wr_driver",uvm_component parent);
@@ -546,10 +596,31 @@ task capture_requests();
 
         local_wr.copy(req);
         local_rd.copy(req);
+		$display("[OPERATION TEST]operation:%s",req.opertion);
+		local_wr.operation = req.operation;
+		local_rd.operation = req.operation;
 
         queue_wr.push_back(local_wr);
-        queue_rd.push_back(local_rd);
+        case (req.operation)
 
+        NORMAL_RW:
+        begin
+        queue_rd.push_back(local_rd);
+        $display("[CAPTURE_NORMAL_RW] T=%0t AWID=%0d ARID=%0d AWADDR=%08h ARADDR=%08h", $time, local_wr.wr_addr_channel.id, local_rd.rd_addr_channel.id, local_wr.wr_addr_channel.addr, local_rd.rd_addr_channel.addr);
+        end
+
+        RD_AFT_WR:
+        begin
+        pending_rd_after_b[local_wr.wr_addr_channel.id].push_back(local_rd);
+        $display("[CAPTURE_RD_AFT_WR] T=%0t AWID=%0d ARID=%0d AWADDR=%08h ARADDR=%08h PENDING=%0d", $time, local_wr.wr_addr_channel.id, local_rd.rd_addr_channel.id, local_wr.wr_addr_channel.addr, local_rd.rd_addr_channel.addr, pending_rd_after_b[local_wr.wr_addr_channel.id].size());
+        end
+
+        default:
+        begin
+        `uvm_error("UNKNOWN_OPERATION", "Unsupported operation mode")
+        end
+
+endcase
         seq_item_port.item_done();
     end
 	
@@ -563,29 +634,27 @@ seq_item tr;
 	wr_status =  new();
 	wait(queue_wr.size() > 0)
 	begin
-      tr = queue_wr[0];
+    tr1 = queue_wr[0];
 	end
-	wr_status.wr_t = tr;
-	display_wr_addr_tr();
-    repeat (2)
-    begin
-        @(wr_cfg.vif.cb_master);
-    end
-    wr_cfg.vif.cb_master.AWID     <= tr.wr_addr_channel.id;
-    wr_cfg.vif.cb_master.AWADDR   <= tr.wr_addr_channel.addr;
-    wr_cfg.vif.cb_master.AWLEN    <= tr.wr_addr_channel.len;
-    wr_cfg.vif.cb_master.AWSIZE   <= tr.wr_addr_channel.size;
-    wr_cfg.vif.cb_master.AWBURST  <= tr.wr_addr_channel.burst;
-    wr_cfg.vif.cb_master.AWLOCK   <= tr.wr_addr_channel.lock;
-    wr_cfg.vif.cb_master.AWCACHE  <= tr.wr_addr_channel.cache;
-    wr_cfg.vif.cb_master.AWPROT   <= tr.wr_addr_channel.prot;
-    wr_cfg.vif.cb_master.AWQOS    <= tr.wr_addr_channel.qos;
-    wr_cfg.vif.cb_master.AWREGION <= tr.wr_addr_channel.region;
-    wr_cfg.vif.cb_master.AWUSER   <= tr.wr_addr_channel.user;
+	wr_status.wr_t = tr1;
+
+    @(wr_cfg.vif.cb_master);
+    wr_cfg.vif.cb_master.AWID     <= tr1.wr_addr_channel.id;
+    wr_cfg.vif.cb_master.AWADDR   <= tr1.wr_addr_channel.addr;
+    wr_cfg.vif.cb_master.AWLEN    <= tr1.wr_addr_channel.len;
+    wr_cfg.vif.cb_master.AWSIZE   <= tr1.wr_addr_channel.size;
+    wr_cfg.vif.cb_master.AWBURST  <= tr1.wr_addr_channel.burst;
+    wr_cfg.vif.cb_master.AWLOCK   <= tr1.wr_addr_channel.lock;
+    wr_cfg.vif.cb_master.AWCACHE  <= tr1.wr_addr_channel.cache;
+    wr_cfg.vif.cb_master.AWPROT   <= tr1.wr_addr_channel.prot;
+    wr_cfg.vif.cb_master.AWQOS    <= tr1.wr_addr_channel.qos;
+    wr_cfg.vif.cb_master.AWREGION <= tr1.wr_addr_channel.region;
+    wr_cfg.vif.cb_master.AWUSER   <= tr1.wr_addr_channel.user;
     wr_cfg.vif.cb_master.AWVALID  <= 1'b1;
     display_wr_addr();
     wait (wr_cfg.vif.cb_master.AWREADY);
     @(wr_cfg.vif.cb_master);
+    display_wr_addr();
     void'(queue_wr.pop_front());
 	wr_status.aw_done = 1;
 	aw_w_order.push_back(wr_status);
@@ -597,7 +666,6 @@ endtask
 task wr_data_channel();
 
     wr_state wr_status;
-
     forever
 	begin
 	wait(aw_w_order.size() > 0)
@@ -621,40 +689,93 @@ task wr_data_channel();
     wr_cfg.vif.cb_master.WVALID <= 1'b0;
 	end
     wr_status.w_done = 1;
-    end
+    end	
+	
 endtask
 
 
 
 task resp_channel();
-    seq_item t;
+
     wr_state wr_status;
+    seq_item released_t;
+    int unsigned bid;
+
     forever
-	begin
-	t = seq_item::type_id::create("t");
-    @(wr_cfg.vif.cb_master);
-    wr_cfg.vif.cb_master.BREADY <= 1'b1;
-    wait (wr_cfg.vif.cb_master.BVALID);
-    @(wr_cfg.vif.cb_master);
-    if (wr_cfg.vif.cb_master.BVALID && wr_cfg.vif.BREADY)
     begin
-        display_wr_bresp();
-    end
-	if(wr_requests.exists(wr_cfg.vif.cb_master.BID) && wr_requests[wr_cfg.vif.cb_master.BID].size() > 0)
-      wr_status = wr_requests[wr_cfg.vif.cb_master.BID][0];
-	if(wr_status.aw_done && wr_status.w_done)
-	   begin
-	   wr_status.b_done    = 1;
-	   no_of_wr_trans_done = t.wr_trans_done++; 
-       void'(wr_requests[wr_cfg.vif.cb_master.BID].pop_front());
-       end   
-	 if(wr_requests[wr_cfg.vif.cb_master.BID].size() == 0)
-	    begin
-        wr_requests.delete(wr_cfg.vif.cb_master.BID);
-		end
+        @(wr_cfg.vif.cb_master);
+
+        wr_cfg.vif.cb_master.BREADY <= 1'b1;
+
+        wait (wr_cfg.vif.cb_master.BVALID);
+
+        @(wr_cfg.vif.cb_master);
+
+        if (wr_cfg.vif.cb_master.BVALID && wr_cfg.vif.BREADY)
+        begin
+            bid = wr_cfg.vif.cb_master.BID;
+
+            display_wr_bresp();
+
+            if (wr_requests.exists(bid) && wr_requests[bid].size() > 0)
+            begin
+                wr_status = wr_requests[bid][0];
+
+                if (wr_status.aw_done && wr_status.w_done)
+                begin
+                    wr_status.b_done = 1'b1;
+
+                    no_of_wr_trans_done++;
+
+                    void'(wr_requests[bid].pop_front());
+
+                    if (wr_requests[bid].size() == 0)
+                    begin
+                        wr_requests.delete(bid);
+                    end
+
+                    if (wr_status.wr_t.operation == RD_AFT_WR)
+                    begin
+                        if (pending_rd_after_b.exists(bid) && pending_rd_after_b[bid].size() > 0)
+                        begin
+                            released_t = pending_rd_after_b[bid].pop_front();
+
+                            if (released_t.wr_addr_channel.id == bid)
+                            begin
+                                queue_rd.push_back(released_t);
+
+                                $display("[RD_AFT_WR_RELEASE] T=%0t BID=%0d ARID=%0d ARADDR=%08h", $time, bid, released_t.rd_addr_channel.id, released_t.rd_addr_channel.addr);
+                            end
+                            else
+                            begin
+                                `uvm_error("RD_AFT_WR_ID_MISMATCH", $sformatf("BID=%0d but released transaction has AWID=%0d", bid, released_t.wr_addr_channel.id))
+                            end
+
+                            if (pending_rd_after_b[bid].size() == 0)
+                            begin
+                                pending_rd_after_b.delete(bid);
+                            end
+                        end
+                        else
+                        begin
+                            `uvm_error("NO_PENDING_RD_AFT_WR", $sformatf("BID=%0d completed RD_AFT_WR write, but no pending read exists", bid))
+                        end
+                    end
+                end
+                else
+                begin
+                    `uvm_error("WRITE_STATE_ERROR", $sformatf("BID=%0d response received before aw_done/w_done. aw_done=%0b w_done=%0b", bid, wr_status.aw_done, wr_status.w_done))
+                end
+            end
+            else
+            begin
+                `uvm_error("UNKNOWN_BID", $sformatf("Received BID=%0d but no matching write is present in wr_requests", bid))
+            end
+        end
+
         wr_cfg.vif.cb_master.BREADY <= 1'b0;
-	
     end
+
 endtask
 
 
@@ -785,9 +906,9 @@ task drive_back_pressure(seq_item tr);
     resp_channel();
 
 endtask
-
-
-task display_wr_addr_tr();
+      
+      
+task display_wr_addr_tr1();
 
     $display("");
     $display("+------------------------------------------------------------------------------------------------------------------+");
@@ -795,11 +916,13 @@ task display_wr_addr_tr();
     $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
     $display("| ID   | ADDRESS    | LEN  | BEATS | SIZE | BURST  | LOCK   | CACHE  | PROT   | QOS    | REGION | USER |");
     $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
-    $display("| %-4d | 0x%08h | %-4d | %-5d | %-4d | %-6d | %-6b | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-2h |", tr.AWID, tr.AWADDR, tr.AWLEN, tr.AWLEN + 1, tr.AWSIZE, tr.AWBURST, tr.AWLOCK, tr.AWCACHE, tr.AWPROT, tr.AWQOS, tr.AWREGION, tr.AWUSER);
+    $display("| %-4d | 0x%08h | %-4d | %-5d | %-4d | %-6d | %-6b | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-4h | 0x%-2h |", tr1.wr_addr_channel.id, tr1.wr_addr_channel.addr, tr1.wr_addr_channel.len, tr1.wr_addr_channel.len + 1, tr1.wr_addr_channel.size, tr1.wr_addr_channel.burst, tr1.wr_addr_channel.lock, tr1.wr_addr_channel.cache, tr1.wr_addr_channel.prot, tr1.wr_addr_channel.qos, tr1.wr_addr_channel.region, tr1.wr_addr_channel.user);
     $display("+------+------------+------+-------+------+--------+--------+--------+--------+--------+--------+------+");
-    $display("TIME=%0t", $time);
+    $display("TIME=%0t  AWVALID=%0b  AWREADY=%0b  HANDSHAKE=%0b", $time, wr_cfg.vif.AWVALID, wr_cfg.vif.cb_master.AWREADY, wr_cfg.vif.AWVALID && wr_cfg.vif.cb_master.AWREADY);
 
 endtask
+      
+
 task display_wr_addr();
 
     $display("");
@@ -1437,7 +1560,7 @@ class fixed_test extends test ;
 		    begin
 		    if(wrap_unan_sq != null && en.wr_ag_tp.wr_agt[i].wr_sr != null)
 		       wrap_unan_sq.start(en.wr_ag_tp.wr_agt[i].wr_sr);
-              wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done == 3 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done == 3);
+              wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done >=3 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done >=3);
             end
 	   phase.drop_objection(this);
 	endtask
@@ -1461,6 +1584,28 @@ class fixed_test extends test ;
             end
 	   phase.drop_objection(this);
 	endtask
+	
+ endclass
+ 
+  class rd_aft_wr_test extends test ;
+  `uvm_component_utils( rd_aft_wr_test)
+   rd_Aft_wr_seqs r_a_w_sq;
+    function new(string name = " rd_aft_wr_test",uvm_component parent);
+	         super.new(name,parent);
+	endfunction
+
+	
+    task run_phase(uvm_phase phase);
+	   phase.raise_objection(this);
+	      r_a_w_sq = rd_Aft_wr_seq::type_id::create("r_a_w_sq");
+	      foreach(wr_cfg[i])
+		    begin
+		    if(r_a_w_sq!= null && en.wr_ag_tp.wr_agt[i].wr_sr != null)
+		       r_a_w_sq.start(en.wr_ag_tp.wr_agt[i].wr_sr);
+            end
+	   phase.drop_objection(this);
+	endtask
+	
  endclass
  
 endpackage 
