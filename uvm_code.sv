@@ -429,14 +429,13 @@ class wrap_align_seq extends wr_seq;
     endfunction
 	task body();
 	   req = seq_item::type_id::create("req");
+      repeat(50)
+      begin
 	  start_item(req);
 	  $display("[%0t] SEQ: before randomize", $time);
 
 if (!req.randomize() with {
-    wr_addr_channel.burst == 2;
-    wr_addr_channel.len   == 7;
-    wr_addr_channel.size  == 2;
-    wr_addr_channel.addr  == 5943;
+            operation == NORMAL_RW;
 }) begin
     $fatal(1, "Randomization failed");
 end
@@ -444,6 +443,7 @@ end
 $display("[%0t] SEQ: after randomize", $time);
 
        finish_item(req);
+      end
 	endtask 
 endclass
 
@@ -471,7 +471,7 @@ class wrap_unalign_seq extends wr_seq;
 	finish_item(req);
     end
   endtask
-  
+endclass
   class rd_Aft_wr_seq extends uvm_sequence #(seq_item);
 
     `uvm_object_utils(rd_Aft_wr_seq)
@@ -495,7 +495,7 @@ class wrap_unalign_seq extends wr_seq;
                 rd_addr_channel.len == wr_addr_channel.len;
                 rd_addr_channel.size == wr_addr_channel.size;
                 rd_addr_channel.burst == wr_addr_channel.burst;
-				operation = RD_AFT_WR;
+				operation == RD_AFT_WR;
             })
             begin
                 `uvm_error("RD_AFT_WR_SEQ", "Randomization failed")
@@ -512,7 +512,6 @@ class wrap_unalign_seq extends wr_seq;
 
 endclass
 
-endclass
 
 class wr_sqr extends uvm_sequencer#(seq_item);
    `uvm_component_utils(wr_sqr)
@@ -596,7 +595,7 @@ task capture_requests();
 
         local_wr.copy(req);
         local_rd.copy(req);
-		$display("[OPERATION TEST]operation:%s",req.opertion);
+        $display("[OPERATION TEST]operation:%s",req.operation);
 		local_wr.operation = req.operation;
 		local_rd.operation = req.operation;
 
@@ -1581,6 +1580,7 @@ class fixed_test extends test ;
 		    begin
 		    if(wrap_an_sq != null && en.wr_ag_tp.wr_agt[i].wr_sr != null)
 		       wrap_an_sq.start(en.wr_ag_tp.wr_agt[i].wr_sr);
+              wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done >=48 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done >=48);
             end
 	   phase.drop_objection(this);
 	endtask
@@ -1589,7 +1589,7 @@ class fixed_test extends test ;
  
   class rd_aft_wr_test extends test ;
   `uvm_component_utils( rd_aft_wr_test)
-   rd_Aft_wr_seqs r_a_w_sq;
+   rd_Aft_wr_seq r_a_w_sq;
     function new(string name = " rd_aft_wr_test",uvm_component parent);
 	         super.new(name,parent);
 	endfunction
@@ -1602,6 +1602,8 @@ class fixed_test extends test ;
 		    begin
 		    if(r_a_w_sq!= null && en.wr_ag_tp.wr_agt[i].wr_sr != null)
 		       r_a_w_sq.start(en.wr_ag_tp.wr_agt[i].wr_sr);
+            
+                   wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done >=3 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done >=3);
             end
 	   phase.drop_objection(this);
 	endtask

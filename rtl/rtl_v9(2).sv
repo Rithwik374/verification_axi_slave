@@ -36,6 +36,8 @@ package axi_fifo_slave_pkg;
   parameter int unsigned W_FIFO_DEPTH  = 8;
   parameter int unsigned AR_FIFO_DEPTH = 4;
   parameter int unsigned R_FIFO_DEPTH  = 8;
+  
+  
 
   // ------------------------------------------------------------
   // AXI enums and constants (from ARM IHI 0022D)
@@ -473,99 +475,265 @@ endmodule
 // ============================================================================
 
 module axi_mem
-  #(parameter int unsigned ADDR_W   = 32,
-    parameter int unsigned DATA_W   = 32,
-    parameter int unsigned MEM_BYTES= 64*1024
-	)
-   (input  logic                 clk,
-    input  logic                 rst_n,
+  #(
+    parameter int unsigned ADDR_W    = 32,
+    parameter int unsigned DATA_W    = 32,
+    parameter int unsigned MEM_BYTES = 64 * 1024
+  )
+  (
+    input  logic                       clk,
+    input  logic                       rst_n,
 
-   // Write port A
-    input  logic                 a_we,                 // write enable (any byte)
-    input  logic [ADDR_W-1:0]    a_addr_base,         // bus base byte address (aligned to DATA_W/8)
-    input  logic [(DATA_W/8)-1:0] a_be,               // byte enables
-    input  logic [DATA_W-1:0]    a_wdata,
+    // ------------------------------------------------
+    // Memory Write Port A
+    // ------------------------------------------------
+    input  logic                       a_we,
+    input  logic [ADDR_W-1:0]          a_addr_base,
+    input  logic [(DATA_W/8)-1:0]      a_be,
+    input  logic [DATA_W-1:0]          a_wdata,
 
-   // Read port B
-    input  logic                 b_re,                 // read enable
-    input  logic [ADDR_W-1:0]    b_addr_base,         // bus base byte address (aligned to DATA_W/8)
-    output logic [DATA_W-1:0]    b_rdata
+    // ------------------------------------------------
+    // Memory Read Port B
+    // ------------------------------------------------
+    input  logic                       b_re,
+    input  logic [ADDR_W-1:0]          b_addr_base,
+    output logic [DATA_W-1:0]          b_rdata
   );
 
-  localparam int unsigned STRB_W = (DATA_W/8);
+  // ================================================================
+  // Local parameters
+  // ================================================================
 
-  // Storage as bytes
+  localparam int unsigned STRB_W =
+      DATA_W / 8;
+ integer init_index;
+
+  // ================================================================
+  // Byte-addressable memory
+  // ================================================================
+
   logic [7:0] mem [0:MEM_BYTES-1];
+  
+ `ifndef SYNTHESIS
 
-  // Mask addresses to memory range (wrap-around)
-  wire [ADDR_W-1:0] a_base = a_addr_base;
-  wire [ADDR_W-1:0] b_base = b_addr_base;
 
-  // Write operation
-  integer i;
-  always_ff @(posedge clk or negedge rst_n)
+
+  initial
+  begin
+    for (init_index = 0;
+         init_index < MEM_BYTES;
+         init_index++)
     begin
-    if (!rst_n) 
-	begin
-      // no init required
+        mem[init_index] = 8'h00;
     end
-	else if (a_we) 
-	begin
-      for (i = 0; i < STRB_W; i++) 
-	  begin
-        if (a_be[i]) 
-		   begin
-          // TODO: If a_base+i exceeds MEM_BYTES-1, define wrap or error handling - requires clarification
-          mem[(a_base + i) % MEM_BYTES] <= a_wdata[8*i +: 8];
-        
+ end
+
+`endif
+
+
+  // ================================================================
+  // Internal memory addresses
+  // ================================================================
+
+  logic [ADDR_W-1:0] a_base;
+  logic [ADDR_W-1:0] b_base;
+
+
+  assign a_base =
+      a_addr_base;
+
+  assign b_base =
+      b_addr_base;
+
+
+ // ================================================================
+// Write Port A
+// ================================================================
+
+integer i;
+
+
+always @(posedge clk)
+begin
+    if (a_we)
+    begin
+        for (i = 0; i < STRB_W; i++)
+        begin
+            if (a_be[i])
+            begin
+                mem[(a_base + i) % MEM_BYTES] <=
+                    a_wdata[8*i +: 8];
+            end
         end
-        
-      end
     end
+end
+  
+  // ================================================================
+  // Read Port B
+  //
+  // Registered read output with same-cycle write forwarding.
+  //
+  // Different address:
+  //     Read existing memory.
+  //
+  // Same address and enabled write byte:
+  //     Return new write data.
+  //
+  // Same address and disabled write byte:
+  //     Return existing memory data.
+  // ================================================================
+
+  integer j;
+
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+      if (!rst_n)
+      begin
+          b_rdata <= '0;
+      end
+      else if (b_re)
+      begin
+          for (j = 0; j < STRB_W; j++)
+          begin
+              if (a_we &&
+                  (a_base == b_base) &&
+                  a_be[j])
+              begin
+                  /*
+                   * Same-cycle read/write collision.
+                   *
+                   * Forward the newly written byte directly
+                   * to the read output.
+                   */
+                  b_rdata[8*j +: 8] <=
+                      a_wdata[8*j +: 8];
+              end
+              else
+              begin
+                  /*
+                   * Normal registered memory read.
+                   */
+                  b_rdata[8*j +: 8] <=
+                      mem[(b_base + j) % MEM_BYTES];
+              end
+          end
+      end
   end
 
-  // Read operation (registered)
-  integer j;
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      b_rdata <= '0;
-    end else if (b_re)
-	begin
-      for (j = 0; j < STRB_W; j++) begin
-        // TODO: If b_base+j exceeds MEM_BYTES-1, define wrap or error handling - requires clarification
-        b_rdata[8*j +: 8] <= mem[(b_base + j) % MEM_BYTES];
+
+`ifndef SYNTHESIS
+
+  // ================================================================
+  // Simulation-only parameter checks
+  // ================================================================
+
+  initial
+  begin
+      if ((DATA_W % 8) != 0)
+      begin
+          $fatal(
+              1,
+              "[AXI_MEM] DATA_W=%0d must be divisible by 8",
+              DATA_W
+          );
       end
-    end
+
+      if (MEM_BYTES < STRB_W)
+      begin
+          $fatal(
+              1,
+              "[AXI_MEM] MEM_BYTES=%0d must be at least STRB_W=%0d",
+              MEM_BYTES,
+              STRB_W
+          );
+      end
   end
+
+`endif
+  
+ `ifndef SYNTHESIS
+
+always_ff @(posedge clk)
+begin
+    if (rst_n)
+    begin
+        if (a_we && b_re)
+        begin
+            $display(
+                "[MEM_RW] T=%0t WADDR=%08h RADDR=%08h SAME=%0b BE=%b WDATA=%08h RDATA=%08h",
+                $time,
+                a_base,
+                b_base,
+                (a_base == b_base),
+                a_be,
+                a_wdata,
+                b_rdata
+            );
+        end
+
+        if (a_we &&
+            b_re &&
+            (a_base == b_base))
+        begin
+            $display(
+                "[MEM_FORWARD] T=%0t ADDR=%08h BE=%b WDATA=%08h",
+                $time,
+                a_base,
+                a_be,
+                a_wdata
+            );
+        end
+    end
+end
+
+`endif
+
 
 endmodule
+// ============================================================================
+// AXI4 FIFO Memory Slave - Fair Out-of-Order Engine Replacements
+//
+// Replace the existing axi_write_engine and axi_read_engine definitions with
+// the two modules in this file. The existing package, sync_fifo, axi_addr_gen,
+// axi_mem, and top-level port connections remain unchanged.
+//
+// Implemented scope
+//   WRITE:
+//     - Multiple outstanding AW acceptance through the existing AW FIFO.
+//     - AXI4 W bursts remain associated with AW transactions in AW order.
+//     - Memory writes remain in AW/W order.
+//     - Completed B responses are stored in a selectable response table.
+//     - Fair round-robin B response selection across eligible IDs.
+//     - B responses may be returned out of order across different IDs.
+//     - B responses remain ordered for the same ID and cannot starve.
+//
+//   READ:
+//     - Multiple outstanding AR requests are stored in a context table.
+//     - Fair round-robin burst-level read scheduling across different IDs.
+//     - Same-ID read transaction order is preserved and cannot starve.
+//     - A selected burst is completed before another burst is selected.
+//     - R beats are buffered in an R response FIFO.
+//
+// Deliberately not implemented
+//   - Read beat interleaving between transactions.
+//   - RAW hazard detection or write-to-read forwarding.
+//   - Exclusive access behavior and error-response generation.
+// ============================================================================
 
-// ============================================================================
-// File       : axi_write_engine.sv
-// Author     : <Your Name / Company>
-// Date       : 2026-03-13
-// Revision   : 1.0
-// Description: AXI4 write channel engine with FIFO buffering and burst support
-// Notes      :
-//   - Compliant with AXI4 handshake & write response dependency (A3-42)
-//   - Supports FIXED/INCR/WRAP, aligned/unaligned using WSTRB and addr_gen
-//   - Single outstanding write transaction to simplify ordering
-// ============================================================================
 module axi_write_engine
   #(
-    parameter int unsigned ADDR_W       = 32,
-    parameter int unsigned DATA_W       = 32,
-    parameter int unsigned ID_W         = 4,
-    parameter int unsigned USER_W       = 1,
-    parameter int unsigned W_FIFO_DEPTH = 8
+    parameter int unsigned ADDR_W                 = 32,
+    parameter int unsigned DATA_W                 = 32,
+    parameter int unsigned ID_W                   = 4,
+    parameter int unsigned USER_W                 = 1,
+    parameter int unsigned AW_FIFO_DEPTH          = 4,
+    parameter int unsigned W_FIFO_DEPTH           = 8,
+    parameter int unsigned B_REORDER_WAIT_CYCLES  = 16
   )
   (
     input  logic                      clk,
     input  logic                      rst_n,
 
-    // ------------------------------------------------
-    // AXI Write Address Channel
-    // ------------------------------------------------
     input  logic [ID_W-1:0]           s_awid,
     input  logic [ADDR_W-1:0]         s_awaddr,
     input  logic [7:0]                s_awlen,
@@ -580,9 +748,6 @@ module axi_write_engine
     input  logic                      s_awvalid,
     output logic                      s_awready,
 
-    // ------------------------------------------------
-    // AXI Write Data Channel
-    // ------------------------------------------------
     input  logic [DATA_W-1:0]         s_wdata,
     input  logic [(DATA_W/8)-1:0]     s_wstrb,
     input  logic                      s_wlast,
@@ -590,18 +755,12 @@ module axi_write_engine
     input  logic                      s_wvalid,
     output logic                      s_wready,
 
-    // ------------------------------------------------
-    // AXI Write Response Channel
-    // ------------------------------------------------
     output logic [ID_W-1:0]           s_bid,
     output logic [1:0]                s_bresp,
     output logic [USER_W-1:0]         s_buser,
     output logic                      s_bvalid,
     input  logic                      s_bready,
 
-    // ------------------------------------------------
-    // Memory Write Port
-    // ------------------------------------------------
     output logic                      mem_we,
     output logic [ADDR_W-1:0]         mem_waddr_base,
     output logic [(DATA_W/8)-1:0]     mem_wbe,
@@ -610,70 +769,137 @@ module axi_write_engine
 
   import axi_fifo_slave_pkg::*;
 
-  localparam int unsigned STRB_W   = DATA_W / 8;
-  localparam int unsigned WENTRY_W =
-      DATA_W + STRB_W + 1 + USER_W;
+  localparam int unsigned STRB_W = DATA_W / 8;
+  localparam int unsigned WENTRY_W = DATA_W + STRB_W + 1 + USER_W;
+  localparam int unsigned AWENTRY_W = $bits(axi_awar_t);
+  localparam int unsigned WR_OUT_CNT_W = (AW_FIFO_DEPTH <= 1) ? 1 : $clog2(AW_FIFO_DEPTH + 1);
+  localparam int unsigned B_INDEX_W = (AW_FIFO_DEPTH <= 1) ? 1 : $clog2(AW_FIFO_DEPTH);
+  localparam int unsigned B_COUNT_W = (AW_FIFO_DEPTH <= 1) ? 1 : $clog2(AW_FIFO_DEPTH + 1);
+  localparam int unsigned B_WAIT_W = (B_REORDER_WAIT_CYCLES <= 1) ? 1 : $clog2(B_REORDER_WAIT_CYCLES + 1);
 
-  // ================================================================
-  // Write-data FIFO entry
-  // ================================================================
-
-  typedef struct packed {
-    logic [DATA_W-1:0]      data;
-    logic [STRB_W-1:0]      strb;
-    logic                   last;
-    logic [USER_W-1:0]      user;
+  typedef struct packed
+  {
+    logic [DATA_W-1:0]  data;
+    logic [STRB_W-1:0]  strb;
+    logic               last;
+    logic [USER_W-1:0]  user;
   } wentry_t;
 
-  // ================================================================
-  // Write-engine state machine
-  // ================================================================
+  typedef struct packed
+  {
+    logic                valid;
+    logic [ID_W-1:0]     id;
+    logic [1:0]          resp;
+    logic [USER_W-1:0]   user;
+    logic [31:0]         seq_no;
+  } b_entry_t;
 
-  typedef enum logic [2:0] {
+  typedef enum logic [2:0]
+  {
     WR_IDLE,
+    WR_POP_AW,
+    WR_CAPTURE_AW,
     WR_WAIT_FIFO,
     WR_POP_FIFO,
     WR_CAPTURE_FIFO,
-    WR_COMMIT,
-    WR_RESPONSE
+    WR_COMMIT
   } wr_state_e;
 
   wr_state_e state;
 
-  // ================================================================
-  // Address transaction registers
-  // ================================================================
-
   axi_awar_t aw_reg;
-
-  logic       aw_active;
+  logic aw_active;
   logic [7:0] w_beats_total;
   logic [7:0] w_accepted_count;
   logic [7:0] w_beat_idx;
 
-  // ================================================================
-  // Write FIFO signals
-  // ================================================================
+  logic aw_fifo_push;
+  logic aw_fifo_pop;
+  logic aw_fifo_full;
+  logic aw_fifo_empty;
+  logic [AWENTRY_W-1:0] aw_fifo_din;
+  logic [AWENTRY_W-1:0] aw_fifo_dout;
+  axi_awar_t aw_fifo_input;
+  axi_awar_t aw_fifo_head;
 
-  logic                    w_fifo_push;
-  logic                    w_fifo_pop;
-  logic                    w_fifo_full;
-  logic                    w_fifo_empty;
+  logic w_fifo_push;
+  logic w_fifo_pop;
+  logic w_fifo_full;
+  logic w_fifo_empty;
+  logic [WENTRY_W-1:0] w_fifo_din;
+  logic [WENTRY_W-1:0] w_fifo_dout;
+  wentry_t wcur_reg;
 
-  logic [WENTRY_W-1:0]     w_fifo_din;
-  logic [WENTRY_W-1:0]     w_fifo_dout;
+  logic [WR_OUT_CNT_W-1:0] wr_outstanding_count;
+  logic aw_fire;
+  logic b_fire;
 
-  wentry_t                 wcur_reg;
+  logic [ADDR_W-1:0] addr_n;
+  logic [ADDR_W-1:0] base_n;
+  logic [$clog2(STRB_W)-1:0] lower_lane;
 
-  assign w_fifo_din = {
-    s_wdata,
-    s_wstrb,
-    s_wlast,
-    s_wuser
-  };
+  b_entry_t b_table [0:AW_FIFO_DEPTH-1];
+  logic [AW_FIFO_DEPTH-1:0] b_eligible;
+  logic b_free_exists;
+  logic [B_INDEX_W-1:0] b_free_idx;
+  logic b_sel_valid;
+  logic [B_INDEX_W-1:0] b_sel_idx;
+  logic [B_INDEX_W-1:0] b_active_idx;
+  logic [B_INDEX_W-1:0] b_rr_ptr;
+  logic [B_COUNT_W-1:0] b_pending_count;
+  logic [31:0] b_seq_counter;
+  logic [B_WAIT_W-1:0] b_wait_count;
+  logic b_launch_allowed;
 
-  assign w_fifo_push =
-      s_wvalid && s_wready;
+  logic final_commit;
+  logic write_complete_fire;
+
+  always_comb
+  begin
+    aw_fifo_input        = '0;
+    aw_fifo_input.id     = s_awid;
+    aw_fifo_input.addr   = s_awaddr;
+    aw_fifo_input.len    = s_awlen;
+    aw_fifo_input.size   = s_awsize;
+    aw_fifo_input.burst  = s_awburst;
+    aw_fifo_input.lock   = s_awlock;
+    aw_fifo_input.cache  = s_awcache;
+    aw_fifo_input.prot   = s_awprot;
+    aw_fifo_input.qos    = s_awqos;
+    aw_fifo_input.region = s_awregion;
+    aw_fifo_input.user   = s_awuser;
+  end
+
+  assign aw_fifo_din  = aw_fifo_input;
+  assign aw_fifo_head = axi_awar_t'(aw_fifo_dout);
+
+  assign w_fifo_din = {s_wdata, s_wstrb, s_wlast, s_wuser};
+
+  assign aw_fire = s_awvalid && s_awready;
+  assign b_fire  = s_bvalid && s_bready;
+
+  assign aw_fifo_push = aw_fire;
+  assign aw_fifo_pop  = (state == WR_POP_AW);
+  assign w_fifo_push  = s_wvalid && s_wready;
+  assign w_fifo_pop   = (state == WR_POP_FIFO);
+
+  assign s_awready = rst_n && !aw_fifo_full && (wr_outstanding_count < AW_FIFO_DEPTH);
+  assign s_wready = rst_n && aw_active && !w_fifo_full && (w_accepted_count < w_beats_total);
+
+  sync_fifo #(
+    .WIDTH (AWENTRY_W),
+    .DEPTH (AW_FIFO_DEPTH)
+  ) u_awfifo (
+    .clk   (clk),
+    .rst_n (rst_n),
+    .push  (aw_fifo_push),
+    .din   (aw_fifo_din),
+    .full  (aw_fifo_full),
+    .pop   (aw_fifo_pop),
+    .dout  (aw_fifo_dout),
+    .empty (aw_fifo_empty),
+    .level ()
+  );
 
   sync_fifo #(
     .WIDTH (WENTRY_W),
@@ -690,37 +916,6 @@ module axi_write_engine
     .level ()
   );
 
-  // ================================================================
-  // AXI channel ready signals
-  // ================================================================
-
-  /*
-   * Only one write address transaction is supported at a time.
-   *
-   * AWREADY is allowed to be high before AWVALID.
-   */
-  assign s_awready =
-      (state == WR_IDLE) &&
-      !aw_active &&
-      !s_bvalid;
-
-  /*
-   * Accept W beats only after AW has been accepted.
-   * Stop accepting once AWLEN+1 beats are received.
-   */
-  assign s_wready =
-      aw_active &&
-      !w_fifo_full &&
-      (w_accepted_count < w_beats_total);
-
-  // ================================================================
-  // Address generation
-  // ================================================================
-
-  logic [ADDR_W-1:0] addr_n;
-  logic [ADDR_W-1:0] base_n;
-  logic [$clog2(STRB_W)-1:0] lower_lane;
-
   axi_addr_gen #(
     .ADDR_W (ADDR_W),
     .DATA_W (DATA_W)
@@ -735,326 +930,367 @@ module axi_write_engine
     .lower_byte_lane (lower_lane)
   );
 
-  // ================================================================
-  // FIFO pop and memory-port control
-  // ================================================================
+  assign final_commit = (w_beat_idx == (w_beats_total - 8'd1));
+  assign write_complete_fire = (state == WR_COMMIT) && final_commit && b_free_exists;
 
-  always_comb begin
+  always_comb
+  begin
+    b_free_exists = 1'b0;
+    b_free_idx    = '0;
 
-    w_fifo_pop = 1'b0;
+    for (int i = 0; i < AW_FIFO_DEPTH; i++)
+    begin
+      if (!b_table[i].valid && !b_free_exists)
+      begin
+        b_free_exists = 1'b1;
+        b_free_idx    = B_INDEX_W'(i);
+      end
+    end
+  end
 
+  always_comb
+  begin
+    b_pending_count = '0;
+
+    for (int i = 0; i < AW_FIFO_DEPTH; i++)
+    begin
+      if (b_table[i].valid)
+      begin
+        b_pending_count = b_pending_count + 1'b1;
+      end
+    end
+  end
+
+  always_comb
+  begin
+    b_eligible = '0;
+
+    for (int i = 0; i < AW_FIFO_DEPTH; i++)
+    begin
+      if (b_table[i].valid)
+      begin
+        b_eligible[i] = 1'b1;
+
+        for (int j = 0; j < AW_FIFO_DEPTH; j++)
+        begin
+          if (b_table[j].valid && (b_table[j].id == b_table[i].id) && (b_table[j].seq_no < b_table[i].seq_no))
+          begin
+            b_eligible[i] = 1'b0;
+          end
+        end
+      end
+    end
+  end
+
+  always_comb
+  begin
+    int unsigned scan_idx;
+
+    b_sel_valid = 1'b0;
+    b_sel_idx   = '0;
+
+    for (int offset = 0; offset < AW_FIFO_DEPTH; offset++)
+    begin
+      scan_idx = b_rr_ptr + offset;
+
+      if (scan_idx >= AW_FIFO_DEPTH)
+      begin
+        scan_idx = scan_idx - AW_FIFO_DEPTH;
+      end
+
+      if (b_eligible[scan_idx] && !b_sel_valid)
+      begin
+        b_sel_valid = 1'b1;
+        b_sel_idx   = B_INDEX_W'(scan_idx);
+      end
+    end
+  end
+
+  always_comb
+  begin
+    b_launch_allowed = 1'b0;
+
+    if (b_pending_count >= 2)
+    begin
+      b_launch_allowed = 1'b1;
+    end
+    else if ((b_pending_count != 0) && (b_pending_count == wr_outstanding_count))
+    begin
+      b_launch_allowed = 1'b1;
+    end
+    else if ((b_pending_count != 0) && (b_wait_count >= B_REORDER_WAIT_CYCLES - 1))
+    begin
+      b_launch_allowed = 1'b1;
+    end
+  end
+
+  always_comb
+  begin
     mem_we         = 1'b0;
     mem_waddr_base = base_n;
     mem_wbe        = wcur_reg.strb;
     mem_wdata      = wcur_reg.data;
 
-    case (state)
-
-      WR_POP_FIFO: begin
-        /*
-         * Pop the FIFO only.
-         * Do not write memory in this cycle.
-         */
-        w_fifo_pop = 1'b1;
-      end
-
-      WR_COMMIT: begin
-        /*
-         * FIFO data was captured into wcur_reg.
-         * It is now safe to write memory.
-         */
+    if (state == WR_COMMIT)
+    begin
+      if (!final_commit || b_free_exists)
+      begin
         mem_we = 1'b1;
       end
-
-      default: begin
-        w_fifo_pop = 1'b0;
-        mem_we     = 1'b0;
-      end
-
-    endcase
-
+    end
   end
 
-  // ================================================================
-  // Main sequential logic
-  // ================================================================
-
-  always_ff @(posedge clk or negedge rst_n) begin
-
-    if (!rst_n) begin
-
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
       state              <= WR_IDLE;
-
       aw_reg             <= '0;
       aw_active          <= 1'b0;
-
       w_beats_total      <= '0;
       w_accepted_count   <= '0;
       w_beat_idx         <= '0;
-
       wcur_reg           <= '0;
-
-      s_bvalid           <= 1'b0;
-      s_bid              <= '0;
-      s_bresp            <= AXI_RESP_OKAY;
-      s_buser            <= '0;
-
     end
-    else begin
-
-      // ------------------------------------------------------------
-      // Count accepted AXI W-channel beats
-      // ------------------------------------------------------------
-
-      if (w_fifo_push) begin
+    else
+    begin
+      if (w_fifo_push)
+      begin
         w_accepted_count <= w_accepted_count + 8'd1;
       end
 
-      // ------------------------------------------------------------
-      // Write-engine state machine
-      // ------------------------------------------------------------
-
       case (state)
-
-        // ==========================================================
-        // Wait for a new AW transaction
-        // ==========================================================
-
-        WR_IDLE: begin
-
+        WR_IDLE:
+        begin
           aw_active        <= 1'b0;
           w_beats_total    <= '0;
           w_accepted_count <= '0;
           w_beat_idx       <= '0;
           wcur_reg         <= '0;
 
-          if (s_awvalid && s_awready) begin
-
-            aw_reg.id      <= s_awid;
-            aw_reg.addr    <= s_awaddr;
-            aw_reg.len     <= s_awlen;
-            aw_reg.size    <= s_awsize;
-            aw_reg.burst   <= s_awburst;
-            aw_reg.lock    <= s_awlock;
-            aw_reg.cache   <= s_awcache;
-            aw_reg.prot    <= s_awprot;
-            aw_reg.qos     <= s_awqos;
-            aw_reg.region  <= s_awregion;
-            aw_reg.user    <= s_awuser;
-
-            aw_active      <= 1'b1;
-            w_beats_total  <= s_awlen + 8'd1;
-            w_beat_idx     <= '0;
-
-            state          <= WR_WAIT_FIFO;
-
+          if (!aw_fifo_empty)
+          begin
+            state <= WR_POP_AW;
           end
-
         end
 
-        // ==========================================================
-        // Wait until at least one W beat exists in the FIFO
-        // ==========================================================
+        WR_POP_AW:
+        begin
+          state <= WR_CAPTURE_AW;
+        end
 
-        WR_WAIT_FIFO: begin
+        WR_CAPTURE_AW:
+        begin
+          aw_reg             <= aw_fifo_head;
+          aw_active          <= 1'b1;
+          w_beats_total      <= aw_fifo_head.len + 8'd1;
+          w_accepted_count   <= '0;
+          w_beat_idx         <= '0;
+          wcur_reg           <= '0;
+          state              <= WR_WAIT_FIFO;
+        end
 
-          if (!w_fifo_empty) begin
+        WR_WAIT_FIFO:
+        begin
+          if (!w_fifo_empty)
+          begin
             state <= WR_POP_FIFO;
           end
-
         end
 
-        // ==========================================================
-        // Generate one FIFO pop
-        // ==========================================================
-
-        WR_POP_FIFO: begin
-
-          /*
-           * w_fifo_pop is asserted combinationally in this state.
-           *
-           * For a synchronous FIFO, dout changes after this clock.
-           */
+        WR_POP_FIFO:
+        begin
           state <= WR_CAPTURE_FIFO;
-
         end
 
-        // ==========================================================
-        // Capture the FIFO output one cycle after pop
-        // ==========================================================
-
-        WR_CAPTURE_FIFO: begin
-
+        WR_CAPTURE_FIFO:
+        begin
           wcur_reg <= wentry_t'(w_fifo_dout);
-
-          state <= WR_COMMIT;
-
+          state    <= WR_COMMIT;
         end
 
-        // ==========================================================
-        // Commit the captured beat to memory
-        // ==========================================================
-
-        WR_COMMIT: begin
-
-          /*
-           * mem_we is asserted combinationally during this state.
-           * The memory consumes:
-           *
-           *   mem_waddr_base = base_n
-           *   mem_wdata      = wcur_reg.data
-           *   mem_wbe        = wcur_reg.strb
-           */
-
-          if (w_beat_idx == (w_beats_total - 8'd1)) begin
-
-            /*
-             * Final expected beat has been committed.
-             */
-            s_bvalid <= 1'b1;
-            s_bid    <= aw_reg.id;
-            s_bresp  <= AXI_RESP_OKAY;
-            s_buser  <= '0;
-
-            state    <= WR_RESPONSE;
-
-          end
-          else begin
-
+        WR_COMMIT:
+        begin
+          if (!final_commit)
+          begin
             w_beat_idx <= w_beat_idx + 8'd1;
-
-            state <= WR_WAIT_FIFO;
-
+            state      <= WR_WAIT_FIFO;
           end
-
+          else if (b_free_exists)
+          begin
+            aw_active          <= 1'b0;
+            w_beats_total      <= '0;
+            w_accepted_count   <= '0;
+            w_beat_idx         <= '0;
+            wcur_reg           <= '0;
+            state              <= WR_IDLE;
+          end
         end
 
-        // ==========================================================
-        // Hold BVALID until BREADY
-        // ==========================================================
-
-        WR_RESPONSE: begin
-
-          if (s_bvalid && s_bready) begin
-
-            s_bvalid         <= 1'b0;
-
-            aw_active        <= 1'b0;
-            w_beats_total    <= '0;
-            w_accepted_count <= '0;
-            w_beat_idx       <= '0;
-            wcur_reg         <= '0;
-
-            state            <= WR_IDLE;
-
-          end
-
-        end
-
-        default: begin
-
+        default:
+        begin
           state              <= WR_IDLE;
+          aw_reg             <= '0;
           aw_active          <= 1'b0;
           w_beats_total      <= '0;
           w_accepted_count   <= '0;
           w_beat_idx         <= '0;
           wcur_reg           <= '0;
-          s_bvalid           <= 1'b0;
-
         end
-
       endcase
-
     end
-
   end
 
-  // ================================================================
-  // Simulation-only protocol checks
-  // ================================================================
-
-/*`ifndef SYNTHESIS
-
-  always_ff @(posedge clk) begin
-
-    if (rst_n && state == WR_COMMIT) begin
-
-      if (wcur_reg.last !==
-          (w_beat_idx == (w_beats_total - 8'd1))) begin
-
-        $error(
-          "[AXI_WRITE_ENGINE] WLAST mismatch: beat=%0d total=%0d WLAST=%b",
-          w_beat_idx,
-          w_beats_total,
-          wcur_reg.last
-        );
-
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      for (int i = 0; i < AW_FIFO_DEPTH; i++)
+      begin
+        b_table[i] <= '0;
       end
 
-      $display(
-        {"[WR_COMMIT] T=%0t beat=%0d/%0d ",
-         "addr=%08h data=%08h be=%b last=%b"},
-        $time,
-        w_beat_idx,
-        w_beats_total - 8'd1,
-        base_n,
-        wcur_reg.data,
-        wcur_reg.strb,
-        wcur_reg.last
-      );
-
+      b_seq_counter <= '0;
     end
+    else
+    begin
+      if (b_fire)
+      begin
+        b_table[b_active_idx].valid <= 1'b0;
+      end
 
+      if (write_complete_fire)
+      begin
+        b_table[b_free_idx].valid  <= 1'b1;
+        b_table[b_free_idx].id     <= aw_reg.id;
+        b_table[b_free_idx].resp   <= AXI_RESP_OKAY;
+        b_table[b_free_idx].user   <= '0;
+        b_table[b_free_idx].seq_no <= b_seq_counter;
+        b_seq_counter              <= b_seq_counter + 1'b1;
+      end
+    end
   end
 
-`endif*/
-  
- /*
-  `ifndef SYNTHESIS
-
-   always @(posedge clk)
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
     begin
+      s_bid        <= '0;
+      s_bresp      <= AXI_RESP_OKAY;
+      s_buser      <= '0;
+      s_bvalid     <= 1'b0;
+      b_active_idx <= '0;
+      b_rr_ptr     <= (AW_FIFO_DEPTH > 1) ? B_INDEX_W'(1) : '0;
+      b_wait_count <= '0;
+    end
+    else
+    begin
+      if (s_bvalid)
+      begin
+        if (s_bready)
+        begin
+          s_bvalid <= 1'b0;
+
+          if (b_active_idx == AW_FIFO_DEPTH - 1)
+          begin
+            b_rr_ptr <= '0;
+          end
+          else
+          begin
+            b_rr_ptr <= b_active_idx + 1'b1;
+          end
+        end
+      end
+      else if (b_sel_valid && b_launch_allowed)
+      begin
+        s_bid        <= b_table[b_sel_idx].id;
+        s_bresp      <= b_table[b_sel_idx].resp;
+        s_buser      <= b_table[b_sel_idx].user;
+        s_bvalid     <= 1'b1;
+        b_active_idx <= b_sel_idx;
+      end
+
+      if ((b_pending_count == 0) || (b_sel_valid && b_launch_allowed) || b_fire)
+      begin
+        b_wait_count <= '0;
+      end
+      else if (b_wait_count < B_REORDER_WAIT_CYCLES)
+      begin
+        b_wait_count <= b_wait_count + 1'b1;
+      end
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      wr_outstanding_count <= '0;
+    end
+    else
+    begin
+      case ({aw_fire, b_fire})
+        2'b10:
+        begin
+          wr_outstanding_count <= wr_outstanding_count + 1'b1;
+        end
+
+        2'b01:
+        begin
+          wr_outstanding_count <= wr_outstanding_count - 1'b1;
+        end
+
+        default:
+        begin
+          wr_outstanding_count <= wr_outstanding_count;
+        end
+      endcase
+    end
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk)
+  begin
     if (rst_n)
     begin
-        if (w_fifo_push || w_fifo_pop || w_fifo_full)
+      if ((state == WR_COMMIT) && mem_we)
+      begin
+        if (wcur_reg.last !== final_commit)
         begin
-          $display("[W_FIFO] T=%0t PUSH=%0b POP=%0b FULL=%0b EMPTY=%0b WVALID=%0b WREADY=%0b",
-                     $time, w_fifo_push, w_fifo_pop, w_fifo_full, w_fifo_empty,
-                      s_wvalid, s_wready);
+          $error("[AXI_WRITE_ENGINE] WLAST mismatch: BID=%0d beat=%0d total=%0d WLAST=%0b", aw_reg.id, w_beat_idx, w_beats_total, wcur_reg.last);
         end
-    end
-end
+      end
 
-`endif*/
-  
+      if (write_complete_fire && !b_free_exists)
+      begin
+        $error("[AXI_WRITE_ENGINE] B response table overflow");
+      end
+
+      if (b_fire && (wr_outstanding_count == 0))
+      begin
+        $error("[AXI_WRITE_ENGINE] Outstanding counter underflow");
+      end
+    end
+  end
+`endif
 
 endmodule
-  
-// ============================================================================
-// File       : axi_read_engine.sv
-// Author     : <Your Name / Company>
-// Date       : 2026-03-13
-// Revision   : 1.0
-// Description: AXI4 read channel engine with FIFO buffering and burst support
-// Notes      :
-//   - Compliant with AXI4 handshake
-//   - Supports FIXED/INCR/WRAP, aligned/unaligned with byte-invariant packing
-//   - Single outstanding read transaction to simplify ordering
-// ============================================================================
+
 
 module axi_read_engine
   #(
-    parameter int unsigned ADDR_W       = 32,
-    parameter int unsigned DATA_W       = 32,
-    parameter int unsigned ID_W         = 4,
-    parameter int unsigned USER_W       = 1,
-    parameter int unsigned R_FIFO_DEPTH = 8
+    parameter int unsigned ADDR_W        = 32,
+    parameter int unsigned DATA_W        = 32,
+    parameter int unsigned ID_W          = 4,
+    parameter int unsigned USER_W                 = 1,
+    parameter int unsigned AR_FIFO_DEPTH          = 4,
+    parameter int unsigned R_FIFO_DEPTH           = 8,
+    parameter int unsigned RD_REORDER_WAIT_CYCLES = 4
   )
   (
     input  logic                      clk,
     input  logic                      rst_n,
 
-    // AXI Read Address Channel
     input  logic [ID_W-1:0]           s_arid,
     input  logic [ADDR_W-1:0]         s_araddr,
     input  logic [7:0]                s_arlen,
@@ -1069,7 +1305,6 @@ module axi_read_engine
     input  logic                      s_arvalid,
     output logic                      s_arready,
 
-    // AXI Read Data Channel
     output logic [ID_W-1:0]           s_rid,
     output logic [DATA_W-1:0]         s_rdata,
     output logic [1:0]                s_rresp,
@@ -1078,7 +1313,6 @@ module axi_read_engine
     output logic                      s_rvalid,
     input  logic                      s_rready,
 
-    // Memory read port
     output logic                      mem_re,
     output logic [ADDR_W-1:0]         mem_raddr_base,
     input  logic [DATA_W-1:0]         mem_rdata
@@ -1087,213 +1321,492 @@ module axi_read_engine
   import axi_fifo_slave_pkg::*;
 
   localparam int unsigned STRB_W = DATA_W / 8;
+  localparam int unsigned RD_INDEX_W = (AR_FIFO_DEPTH <= 1) ? 1 : $clog2(AR_FIFO_DEPTH);
+  localparam int unsigned RD_COUNT_W = (AR_FIFO_DEPTH <= 1) ? 1 : $clog2(AR_FIFO_DEPTH + 1);
+  localparam int unsigned RD_WAIT_W = (RD_REORDER_WAIT_CYCLES <= 1) ? 1 : $clog2(RD_REORDER_WAIT_CYCLES + 1);
 
-  typedef enum logic [2:0] {
+  typedef struct packed
+  {
+    logic                  valid;
+    logic [ID_W-1:0]       id;
+    logic [ADDR_W-1:0]     addr;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+    logic                  lock;
+    logic [3:0]            cache;
+    logic [2:0]            prot;
+    logic [3:0]            qos;
+    logic [3:0]            region;
+    logic [USER_W-1:0]     user;
+    logic [31:0]           seq_no;
+  } rd_ctx_t;
+
+  typedef struct packed
+  {
+    logic [ID_W-1:0]       id;
+    logic [DATA_W-1:0]     data;
+    logic [1:0]            resp;
+    logic                  last;
+    logic [USER_W-1:0]     user;
+  } r_entry_t;
+
+  localparam int unsigned RENTRY_W = $bits(r_entry_t);
+
+  typedef enum logic [1:0]
+  {
     RD_IDLE,
     RD_ISSUE,
-    RD_WAIT_MEMORY,
-    RD_CAPTURE,
-    RD_SEND
-  } rd_state_e;
+    RD_CAPTURE_MEMORY
+  } rd_gen_state_e;
 
-  rd_state_e state;
+  typedef enum logic [1:0]
+  {
+    R_OUT_IDLE,
+    R_OUT_POP,
+    R_OUT_CAPTURE,
+    R_OUT_HOLD
+  } r_out_state_e;
 
-  axi_awar_t ar_reg;
+  rd_ctx_t rd_ctx [0:AR_FIFO_DEPTH-1];
+  logic [AR_FIFO_DEPTH-1:0] rd_eligible;
+  logic rd_free_exists;
+  logic [RD_INDEX_W-1:0] rd_free_idx;
+  logic rd_sel_valid;
+  logic [RD_INDEX_W-1:0] rd_sel_idx;
+  logic [RD_INDEX_W-1:0] rd_rr_ptr;
+  logic [RD_COUNT_W-1:0] rd_pending_count;
+  logic [RD_WAIT_W-1:0] rd_wait_count;
+  logic rd_launch_allowed;
+  logic [31:0] rd_seq_counter;
 
-  logic [7:0] r_beats_total;
-  logic [7:0] r_beat_idx;
+  rd_gen_state_e rd_gen_state;
+  rd_ctx_t active_read;
+  logic [RD_INDEX_W-1:0] active_slot;
+  logic [7:0] active_beat_idx;
+  logic rd_context_complete;
 
   logic [ADDR_W-1:0] addr_n;
   logic [ADDR_W-1:0] base_n;
   logic [$clog2(STRB_W)-1:0] lower_lane;
+  logic [DATA_W-1:0] packed_memory_data;
 
-  logic [DATA_W-1:0] memory_data_reg;
-  logic [DATA_W-1:0] packed_data;
+  r_entry_t r_fifo_input;
+  r_entry_t r_fifo_head;
+  logic [RENTRY_W-1:0] r_fifo_din;
+  logic [RENTRY_W-1:0] r_fifo_dout;
+  logic r_fifo_push;
+  logic r_fifo_pop;
+  logic r_fifo_full;
+  logic r_fifo_empty;
+
+  r_out_state_e r_out_state;
+
+  logic ar_fire;
+  logic r_done_fire;
+  logic [RD_COUNT_W-1:0] rd_outstanding_count;
+
+  assign ar_fire     = s_arvalid && s_arready;
+  assign r_done_fire = s_rvalid && s_rready && s_rlast;
+
+  always_comb
+  begin
+    rd_free_exists = 1'b0;
+    rd_free_idx    = '0;
+
+    for (int i = 0; i < AR_FIFO_DEPTH; i++)
+    begin
+      if (!rd_ctx[i].valid && !rd_free_exists)
+      begin
+        rd_free_exists = 1'b1;
+        rd_free_idx    = RD_INDEX_W'(i);
+      end
+    end
+  end
+
+  assign s_arready = rst_n && rd_free_exists && (rd_outstanding_count < AR_FIFO_DEPTH);
+
+  always_comb
+  begin
+    rd_pending_count = '0;
+
+    for (int i = 0; i < AR_FIFO_DEPTH; i++)
+    begin
+      if (rd_ctx[i].valid)
+      begin
+        rd_pending_count = rd_pending_count + 1'b1;
+      end
+    end
+  end
+
+  always_comb
+  begin
+    rd_eligible = '0;
+
+    for (int i = 0; i < AR_FIFO_DEPTH; i++)
+    begin
+      if (rd_ctx[i].valid)
+      begin
+        rd_eligible[i] = 1'b1;
+
+        for (int j = 0; j < AR_FIFO_DEPTH; j++)
+        begin
+          if (rd_ctx[j].valid && (rd_ctx[j].id == rd_ctx[i].id) && (rd_ctx[j].seq_no < rd_ctx[i].seq_no))
+          begin
+            rd_eligible[i] = 1'b0;
+          end
+        end
+      end
+    end
+  end
+
+  always_comb
+  begin
+    int unsigned scan_idx;
+
+    rd_sel_valid = 1'b0;
+    rd_sel_idx   = '0;
+
+    for (int offset = 0; offset < AR_FIFO_DEPTH; offset++)
+    begin
+      scan_idx = rd_rr_ptr + offset;
+
+      if (scan_idx >= AR_FIFO_DEPTH)
+      begin
+        scan_idx = scan_idx - AR_FIFO_DEPTH;
+      end
+
+      if (rd_eligible[scan_idx] && !rd_sel_valid)
+      begin
+        rd_sel_valid = 1'b1;
+        rd_sel_idx   = RD_INDEX_W'(scan_idx);
+      end
+    end
+  end
+
+  always_comb
+  begin
+    rd_launch_allowed = 1'b0;
+
+    if (rd_pending_count >= 2)
+    begin
+      rd_launch_allowed = 1'b1;
+    end
+    else if ((rd_pending_count != 0) && (rd_wait_count >= RD_REORDER_WAIT_CYCLES - 1))
+    begin
+      rd_launch_allowed = 1'b1;
+    end
+  end
 
   axi_addr_gen #(
     .ADDR_W (ADDR_W),
     .DATA_W (DATA_W)
   ) u_addr_gen_r (
-    .start_addr      (ar_reg.addr),
-    .size            (ar_reg.size),
-    .burst           (ar_reg.burst),
-    .len             (ar_reg.len),
-    .beat_idx        (r_beat_idx),
+    .start_addr      (active_read.addr),
+    .size            (active_read.size),
+    .burst           (active_read.burst),
+    .len             (active_read.len),
+    .beat_idx        (active_beat_idx),
     .addr_n          (addr_n),
     .bus_base_addr   (base_n),
     .lower_byte_lane (lower_lane)
   );
 
-  assign s_arready =
-      (state == RD_IDLE);
-
   assign mem_raddr_base = base_n;
 
-  always_comb begin
-    mem_re = 1'b0;
+  always_comb
+  begin
+    packed_memory_data = '0;
 
-    if (state == RD_ISSUE)
-      mem_re = 1'b1;
-  end
-
-  always_comb begin
-    packed_data = '0;
-
-    for (int lane = 0; lane < STRB_W; lane++) begin
-      if ((lane >= lower_lane) &&
-          (lane < lower_lane + (1 << ar_reg.size))) begin
-
-        packed_data[8*lane +: 8] =
-            memory_data_reg[8*lane +: 8];
+    for (int lane = 0; lane < STRB_W; lane++)
+    begin
+      if ((lane >= lower_lane) && (lane < lower_lane + (1 << active_read.size)))
+      begin
+        packed_memory_data[8*lane +: 8] = mem_rdata[8*lane +: 8];
       end
     end
   end
 
-  always_ff @(posedge clk or negedge rst_n) begin
+  always_comb
+  begin
+    r_fifo_input      = '0;
+    r_fifo_input.id   = active_read.id;
+    r_fifo_input.data = packed_memory_data;
+    r_fifo_input.resp = AXI_RESP_OKAY;
+    r_fifo_input.last = (active_beat_idx == active_read.len);
+    r_fifo_input.user = '0;
+  end
 
-    if (!rst_n) begin
+  assign r_fifo_din  = r_fifo_input;
+  assign r_fifo_head = r_entry_t'(r_fifo_dout);
+  assign r_fifo_push = (rd_gen_state == RD_CAPTURE_MEMORY);
+  assign r_fifo_pop  = (r_out_state == R_OUT_POP);
 
-      state           <= RD_IDLE;
-      ar_reg          <= '0;
-      r_beats_total   <= '0;
-      r_beat_idx      <= '0;
-      memory_data_reg <= '0;
+  sync_fifo #(
+    .WIDTH (RENTRY_W),
+    .DEPTH (R_FIFO_DEPTH)
+  ) u_rfifo (
+    .clk   (clk),
+    .rst_n (rst_n),
+    .push  (r_fifo_push),
+    .din   (r_fifo_din),
+    .full  (r_fifo_full),
+    .pop   (r_fifo_pop),
+    .dout  (r_fifo_dout),
+    .empty (r_fifo_empty),
+    .level ()
+  );
 
-      s_rid           <= '0;
-      s_rdata         <= '0;
-      s_rresp         <= AXI_RESP_OKAY;
-      s_rlast         <= 1'b0;
-      s_ruser         <= '0;
-      s_rvalid        <= 1'b0;
+  always_comb
+  begin
+    mem_re = 1'b0;
 
+    if ((rd_gen_state == RD_ISSUE) && !r_fifo_full)
+    begin
+      mem_re = 1'b1;
     end
-    else begin
+  end
 
-      case (state)
+  assign rd_context_complete = (rd_gen_state == RD_CAPTURE_MEMORY) && (active_beat_idx == active_read.len);
 
-        RD_IDLE: 
-		begin
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      for (int i = 0; i < AR_FIFO_DEPTH; i++)
+      begin
+        rd_ctx[i] <= '0;
+      end
 
-          s_rvalid   <= 1'b0;
-          s_rlast    <= 1'b0;
-          r_beat_idx <= 8'd0;
+      rd_seq_counter <= '0;
+    end
+    else
+    begin
+      if (rd_context_complete)
+      begin
+        rd_ctx[active_slot].valid <= 1'b0;
+      end
 
-          if (s_arvalid && s_arready) 
-		  begin
+      if (ar_fire)
+      begin
+        rd_ctx[rd_free_idx].valid  <= 1'b1;
+        rd_ctx[rd_free_idx].id     <= s_arid;
+        rd_ctx[rd_free_idx].addr   <= s_araddr;
+        rd_ctx[rd_free_idx].len    <= s_arlen;
+        rd_ctx[rd_free_idx].size   <= s_arsize;
+        rd_ctx[rd_free_idx].burst  <= s_arburst;
+        rd_ctx[rd_free_idx].lock   <= s_arlock;
+        rd_ctx[rd_free_idx].cache  <= s_arcache;
+        rd_ctx[rd_free_idx].prot   <= s_arprot;
+        rd_ctx[rd_free_idx].qos    <= s_arqos;
+        rd_ctx[rd_free_idx].region <= s_arregion;
+        rd_ctx[rd_free_idx].user   <= s_aruser;
+        rd_ctx[rd_free_idx].seq_no <= rd_seq_counter;
+        rd_seq_counter             <= rd_seq_counter + 1'b1;
+      end
+    end
+  end
 
-            ar_reg.id     <= s_arid;
-            ar_reg.addr   <= s_araddr;
-            ar_reg.len    <= s_arlen;
-            ar_reg.size   <= s_arsize;
-            ar_reg.burst  <= s_arburst;
-            ar_reg.lock   <= s_arlock;
-            ar_reg.cache  <= s_arcache;
-            ar_reg.prot   <= s_arprot;
-            ar_reg.qos    <= s_arqos;
-            ar_reg.region <= s_arregion;
-            ar_reg.user   <= s_aruser;
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      rd_gen_state    <= RD_IDLE;
+      active_read     <= '0;
+      active_slot     <= '0;
+      active_beat_idx <= '0;
+      rd_rr_ptr        <= (AR_FIFO_DEPTH > 1) ? RD_INDEX_W'(1) : '0;
+      rd_wait_count    <= '0;
+    end
+    else
+    begin
+      case (rd_gen_state)
+        RD_IDLE:
+        begin
+          active_beat_idx <= '0;
 
-            r_beats_total <= s_arlen + 8'd1;
-            r_beat_idx    <= 8'd0;
+          if (rd_sel_valid && rd_launch_allowed)
+          begin
+            active_read     <= rd_ctx[rd_sel_idx];
+            active_slot     <= rd_sel_idx;
+            active_beat_idx <= '0;
+            rd_gen_state    <= RD_ISSUE;
+            rd_wait_count   <= '0;
 
-            state         <= RD_ISSUE;
-
+            if (rd_sel_idx == AR_FIFO_DEPTH - 1)
+            begin
+              rd_rr_ptr <= '0;
+            end
+            else
+            begin
+              rd_rr_ptr <= rd_sel_idx + 1'b1;
+            end
+          end
+          else if (rd_pending_count == 0)
+          begin
+            rd_wait_count <= '0;
+          end
+          else if (rd_wait_count < RD_REORDER_WAIT_CYCLES)
+          begin
+            rd_wait_count <= rd_wait_count + 1'b1;
           end
         end
 
-        RD_ISSUE: begin
-          // mem_re is asserted in this state
-          state <= RD_WAIT_MEMORY;
-        end
-
-        RD_WAIT_MEMORY: begin
-          // Wait one cycle for registered memory output
-          state <= RD_CAPTURE;
-        end
-
-        RD_CAPTURE: begin
-
-          memory_data_reg <= mem_rdata;
-
-          state <= RD_SEND;
-
-        end
-
-        RD_SEND: begin
-
-          if (!s_rvalid) begin
-
-            s_rid    <= ar_reg.id;
-            s_rdata  <= packed_data;
-            s_rresp  <= AXI_RESP_OKAY;
-            s_ruser  <= '0;
-            s_rlast  <=
-                (r_beat_idx == r_beats_total - 8'd1);
-
-            s_rvalid <= 1'b1;
-
+        RD_ISSUE:
+        begin
+          if (!r_fifo_full)
+          begin
+            rd_gen_state <= RD_CAPTURE_MEMORY;
           end
-          else if (s_rvalid && s_rready) begin
+        end
 
+        RD_CAPTURE_MEMORY:
+        begin
+          if (active_beat_idx == active_read.len)
+          begin
+            active_beat_idx <= '0;
+            rd_gen_state    <= RD_IDLE;
+          end
+          else
+          begin
+            active_beat_idx <= active_beat_idx + 8'd1;
+            rd_gen_state    <= RD_ISSUE;
+          end
+        end
+
+        default:
+        begin
+          rd_gen_state    <= RD_IDLE;
+          active_read     <= '0;
+          active_slot     <= '0;
+          active_beat_idx <= '0;
+          rd_wait_count    <= '0;
+        end
+      endcase
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      r_out_state <= R_OUT_IDLE;
+      s_rid       <= '0;
+      s_rdata     <= '0;
+      s_rresp     <= AXI_RESP_OKAY;
+      s_rlast     <= 1'b0;
+      s_ruser     <= '0;
+      s_rvalid    <= 1'b0;
+    end
+    else
+    begin
+      case (r_out_state)
+        R_OUT_IDLE:
+        begin
+          s_rvalid <= 1'b0;
+
+          if (!r_fifo_empty)
+          begin
+            r_out_state <= R_OUT_POP;
+          end
+        end
+
+        R_OUT_POP:
+        begin
+          r_out_state <= R_OUT_CAPTURE;
+        end
+
+        R_OUT_CAPTURE:
+        begin
+          s_rid       <= r_fifo_head.id;
+          s_rdata     <= r_fifo_head.data;
+          s_rresp     <= r_fifo_head.resp;
+          s_rlast     <= r_fifo_head.last;
+          s_ruser     <= r_fifo_head.user;
+          s_rvalid    <= 1'b1;
+          r_out_state <= R_OUT_HOLD;
+        end
+
+        R_OUT_HOLD:
+        begin
+          if (s_rvalid && s_rready)
+          begin
             s_rvalid <= 1'b0;
 
-            if (s_rlast) begin
-
-              s_rlast    <= 1'b0;
-              r_beat_idx <= 8'd0;
-              state      <= RD_IDLE;
-
+            if (!r_fifo_empty)
+            begin
+              r_out_state <= R_OUT_POP;
             end
-            else begin
-
-              r_beat_idx <= r_beat_idx + 8'd1;
-              state      <= RD_ISSUE;
-
+            else
+            begin
+              r_out_state <= R_OUT_IDLE;
             end
-
           end
         end
 
-        default: begin
+        default:
+        begin
+          r_out_state <= R_OUT_IDLE;
+          s_rvalid    <= 1'b0;
+          s_rlast     <= 1'b0;
+        end
+      endcase
+    end
+  end
 
-          state      <= RD_IDLE;
-          s_rvalid   <= 1'b0;
-          s_rlast    <= 1'b0;
-          r_beat_idx <= 8'd0;
-
+  always_ff @(posedge clk or negedge rst_n)
+  begin
+    if (!rst_n)
+    begin
+      rd_outstanding_count <= '0;
+    end
+    else
+    begin
+      case ({ar_fire, r_done_fire})
+        2'b10:
+        begin
+          rd_outstanding_count <= rd_outstanding_count + 1'b1;
         end
 
+        2'b01:
+        begin
+          rd_outstanding_count <= rd_outstanding_count - 1'b1;
+        end
+
+        default:
+        begin
+          rd_outstanding_count <= rd_outstanding_count;
+        end
       endcase
-
     end
   end
 
- /*`ifndef SYNTHESIS
+`ifndef SYNTHESIS
+  always_ff @(posedge clk)
+  begin
+    if (rst_n)
+    begin
+      if (r_fifo_push && r_fifo_full)
+      begin
+        $error("[AXI_READ_ENGINE] Push attempted while R FIFO full");
+      end
 
- always @(posedge clk) begin
+      if (ar_fire && !rd_free_exists)
+      begin
+        $error("[AXI_READ_ENGINE] Read context table overflow");
+      end
 
-    if (state != RD_IDLE) begin
-      $display(
-        "[RD_ENGINE] T=%0t state=%0d beat=%0d/%0d mem_re=%b mem_addr=%08h mem_data=%08h RVALID=%b RREADY=%b RDATA=%08h RLAST=%b",
-        $time,
-        state,
-        r_beat_idx,
-        r_beats_total - 1,
-        mem_re,
-        mem_raddr_base,
-        mem_rdata,
-        s_rvalid,
-        s_rready,
-        s_rdata,
-        s_rlast
-      );
+      if (r_done_fire && (rd_outstanding_count == 0))
+      begin
+        $error("[AXI_READ_ENGINE] Outstanding counter underflow");
+      end
     end
-
   end
-
-`endif*/
+`endif
 
 endmodule
+
+
 // ============================================================================
 // File       : axi_fifo_slave_top.sv
 // Author     : <Your Name / Company>
@@ -1313,7 +1826,9 @@ module axi_fifo_slave_top
     parameter int unsigned ID_W       = 4,
     parameter int unsigned USER_W     = 1,
     parameter int unsigned MEM_BYTES  = 64*1024,
+	parameter int unsigned AW_FIFO_DEPTH = 4,
     parameter int unsigned W_FIFO_DEPTH = 8,
+    parameter int unsigned AR_FIFO_DEPTH = 4,
     parameter int unsigned R_FIFO_DEPTH = 8)
   (
    input  logic                 aclk,
@@ -1411,13 +1926,14 @@ module axi_fifo_slave_top
   // -----------------------------
   // Write engine
   // -----------------------------
-  axi_write_engine #(
+axi_write_engine #(
     .ADDR_W        (ADDR_W),
     .DATA_W        (DATA_W),
     .ID_W          (ID_W),
     .USER_W        (USER_W),
-    .W_FIFO_DEPTH  (W_FIFO_DEPTH)
-  ) u_wr (
+    .AW_FIFO_DEPTH (AW_FIFO_DEPTH),
+    .W_FIFO_DEPTH  (W_FIFO_DEPTH)) 
+    u_wr (
     .clk           (aclk),
     .rst_n         (areset_n),
 
@@ -1462,8 +1978,9 @@ module axi_fifo_slave_top
     .DATA_W        (DATA_W),
     .ID_W          (ID_W),
     .USER_W        (USER_W),
+    .AR_FIFO_DEPTH (AR_FIFO_DEPTH),
     .R_FIFO_DEPTH  (R_FIFO_DEPTH)
-  ) u_rd (
+   ) u_rd (
     .clk           (aclk),
     .rst_n         (areset_n),
 
