@@ -429,13 +429,13 @@ class wrap_align_seq extends wr_seq;
     endfunction
 	task body();
 	   req = seq_item::type_id::create("req");
-      repeat(50)
+      repeat(20)
       begin
 	  start_item(req);
 	  $display("[%0t] SEQ: before randomize", $time);
 
 if (!req.randomize() with {
-            operation == NORMAL_RW;
+            operation == RD_AFT_WR;
 }) begin
     $fatal(1, "Randomization failed");
 end
@@ -1015,92 +1015,228 @@ endtask
 endclass
 
 
-class wr_monitor extends uvm_monitor;
-  `uvm_component_utils(wr_monitor)
-    uvm_analysis_port#(seq_item) w_mn2sb;
-    wr_config wr_cfg;
-	seq_item t;
-    function new(string name = "wr_monitor",uvm_component parent);
-            super.new(name,parent);
-			w_mn2sb = new("w_mn2sb",this);
-    endfunction
-	
-	function void build_phase(uvm_phase phase);
-	    if(!uvm_config_db#(wr_config)::get(this,"","wr_cfg",wr_cfg))
-		   `uvm_fatal("CONFIG_ERROR","WR_MONITOR :configuration is not working properly")
-	endfunction 
-	
-	task run_phase(uvm_phase phase);
-	forever
-	begin
-	  t = seq_item::type_id::create("t");
-    
-   	   wr_addr_mon(t);
-	   wr_data_mon(t);
-	   wr_resp_mon(t);
-	   w_mn2sb.write(t);
-    	
-	end
-	endtask
-    
-	task wr_addr_mon(seq_item tr);
-    forever
-	    begin
-		@(wr_cfg.vif.cb_monitor);
-          if(wr_cfg.vif.cb_monitor.AWVALID && wr_cfg.vif.cb_monitor.AWREADY)
-		   begin  
-			tr.wr_addr_channel.id     = wr_cfg.vif.cb_monitor.AWID;
-			tr.wr_addr_channel.addr   = wr_cfg.vif.cb_monitor.AWADDR;
-			tr.wr_addr_channel.len    = wr_cfg.vif.cb_monitor.AWLEN;
-			tr.wr_addr_channel.size   = wr_cfg.vif.cb_monitor.AWSIZE;
-			tr.wr_addr_channel.burst  = wr_cfg.vif.cb_monitor.AWBURST;
-			tr.wr_addr_channel.lock   = wr_cfg.vif.cb_monitor.AWLOCK;
-			tr.wr_addr_channel.cache  = wr_cfg.vif.cb_monitor.AWCACHE;
-			tr.wr_addr_channel.prot   = wr_cfg.vif.cb_monitor.AWPROT;
-			tr.wr_addr_channel.qos    = wr_cfg.vif.cb_monitor.AWQOS;
-			tr.wr_addr_channel.region = wr_cfg.vif.cb_monitor.AWREGION;
-			tr.wr_addr_channel.user   = wr_cfg.vif.cb_monitor.AWUSER;
-            break;
-		   end
-	    end
-	endtask
-	
-      task wr_data_mon(seq_item tr);
-	    
-		foreach(tr.wr_data_channel[i])
-		begin
-	    forever
-	    begin
-		   @(wr_cfg.vif.cb_monitor);
-          if(wr_cfg.vif.cb_monitor.WVALID && wr_cfg.vif.cb_monitor.WREADY)
-		   begin
-             tr.wr_data_channel[i].last    = wr_cfg.vif.cb_monitor.WLAST;
-             tr.wr_data_channel[i].user   = wr_cfg.vif.cb_monitor.WUSER;
-             tr.wr_data_channel[i].strb    = wr_cfg.vif.cb_monitor.WSTRB;
-             tr.wr_data_channel[i].data    = wr_cfg.vif.cb_monitor.WDATA;
-			
-            break;
-		   end
-	    end
-	    end
-	endtask
-    
-      task wr_resp_mon(seq_item tr);
-        forever
-           begin
-             @(wr_cfg.vif.cb_monitor);
-             if(wr_cfg.vif.cb_monitor.BVALID && wr_cfg.vif.cb_monitor.BREADY)
-               begin
-               tr.wr_resp_channel.id      = wr_cfg.vif.cb_monitor.BID;
-                 tr.wr_resp_channel.resp  =  axi_resp_e'(wr_cfg.vif.cb_monitor.BRESP);
-               tr.wr_resp_channel.user    = wr_cfg.vif.cb_monitor.BUSER;
-               break;
-               end
-           end
-       endtask
-	
-endclass
 
+class wr_monitor extends uvm_monitor;
+
+    `uvm_component_utils(wr_monitor)
+
+    uvm_analysis_port #(seq_item) w_mn2sb;
+
+    wr_config wr_cfg;
+    seq_item aw_pending_q[$];
+    seq_item w_burst_q[$];
+    seq_item pending_write_by_id[int unsigned][$];
+    axi_wbeat_t current_w_beats[$];
+
+    function new(string name = "wr_monitor", uvm_component parent);
+        super.new(name, parent);
+        w_mn2sb = new("w_mn2sb", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+
+        super.build_phase(phase);
+
+        if (!uvm_config_db #(wr_config)::get(this, "", "wr_cfg", wr_cfg))
+        begin
+            `uvm_fatal("CONFIG_ERROR", "WR_MONITOR: configuration is not available")
+        end
+
+    endfunction
+
+    task run_phase(uvm_phase phase);
+
+        forever
+        begin
+            @(wr_cfg.vif.cb_monitor);
+
+            if (!wr_cfg.vif.ARESETn)
+            begin
+                aw_pending_q.delete();
+                w_burst_q.delete();
+                pending_write_by_id.delete();
+                current_w_beats.delete();
+                continue;
+            end
+
+            // AW and W are independent AXI channels. Capture both on their
+            // own handshakes. AW is processed first only to handle the case
+            // where AW and the first W beat are accepted in the same cycle.
+            if (wr_cfg.vif.cb_monitor.AWVALID &&
+                wr_cfg.vif.cb_monitor.AWREADY)
+            begin
+                capture_aw();
+            end
+
+            if (wr_cfg.vif.cb_monitor.WVALID &&
+                wr_cfg.vif.cb_monitor.WREADY)
+            begin
+                capture_w();
+            end
+          
+            pair_aw_and_w();
+
+            if (wr_cfg.vif.cb_monitor.BVALID &&
+                wr_cfg.vif.cb_monitor.BREADY)
+            begin
+                capture_b();
+            end
+        end
+
+    endtask
+
+    task capture_aw();
+
+        seq_item tr;
+
+        tr = seq_item::type_id::create("aw_tr");
+
+        tr.wr_addr_channel.id     = wr_cfg.vif.cb_monitor.AWID;
+        tr.wr_addr_channel.addr   = wr_cfg.vif.cb_monitor.AWADDR;
+        tr.wr_addr_channel.len    = wr_cfg.vif.cb_monitor.AWLEN;
+        tr.wr_addr_channel.size   = wr_cfg.vif.cb_monitor.AWSIZE;
+        tr.wr_addr_channel.burst  = wr_cfg.vif.cb_monitor.AWBURST;
+        tr.wr_addr_channel.lock   = wr_cfg.vif.cb_monitor.AWLOCK;
+        tr.wr_addr_channel.cache  = wr_cfg.vif.cb_monitor.AWCACHE;
+        tr.wr_addr_channel.prot   = wr_cfg.vif.cb_monitor.AWPROT;
+        tr.wr_addr_channel.qos    = wr_cfg.vif.cb_monitor.AWQOS;
+        tr.wr_addr_channel.region = wr_cfg.vif.cb_monitor.AWREGION;
+        tr.wr_addr_channel.user   = wr_cfg.vif.cb_monitor.AWUSER;
+
+        aw_pending_q.push_back(tr);
+
+        `uvm_info("WR_MON_AW", $sformatf("AW accepted: ID=%0d ADDR=0x%08h LEN=%0d SIZE=%0d BURST=%0d", tr.wr_addr_channel.id, tr.wr_addr_channel.addr, tr.wr_addr_channel.len, tr.wr_addr_channel.size, tr.wr_addr_channel.burst), UVM_HIGH)
+
+    endtask
+
+    task capture_w();
+
+        axi_wbeat_t beat;
+        seq_item burst_tr;
+
+        beat      = '0;
+        beat.data = wr_cfg.vif.cb_monitor.WDATA;
+        beat.strb = wr_cfg.vif.cb_monitor.WSTRB;
+        beat.last = wr_cfg.vif.cb_monitor.WLAST;
+        beat.user = wr_cfg.vif.cb_monitor.WUSER;
+
+        current_w_beats.push_back(beat);
+
+        if (beat.last)
+        begin
+            burst_tr = seq_item::type_id::create("w_burst_tr");
+            burst_tr.wr_data_channel = new[current_w_beats.size()];
+
+            foreach (current_w_beats[i])
+            begin
+                burst_tr.wr_data_channel[i] = current_w_beats[i];
+            end
+
+            w_burst_q.push_back(burst_tr);
+            current_w_beats.delete();
+        end
+
+    endtask
+
+    task pair_aw_and_w();
+
+        seq_item aw_tr;
+        seq_item w_tr;
+        int unsigned id;
+        int unsigned expected_beats;
+        int unsigned actual_beats;
+
+        while (aw_pending_q.size() > 0 && w_burst_q.size() > 0)
+        begin
+            aw_tr = aw_pending_q.pop_front();
+            w_tr  = w_burst_q.pop_front();
+
+            expected_beats = aw_tr.wr_addr_channel.len + 1;
+            actual_beats   = w_tr.wr_data_channel.size();
+
+            aw_tr.wr_data_channel = new[actual_beats];
+
+            foreach (w_tr.wr_data_channel[i])
+            begin
+                aw_tr.wr_data_channel[i] = w_tr.wr_data_channel[i];
+            end
+
+            if (actual_beats != expected_beats)
+            begin
+                `uvm_error("WR_MON_BEAT_COUNT", $sformatf("ID=%0d expected W beats=%0d observed W beats=%0d", aw_tr.wr_addr_channel.id, expected_beats, actual_beats))
+            end
+
+            foreach (aw_tr.wr_data_channel[i])
+            begin
+                if (aw_tr.wr_data_channel[i].last !=
+                    (i == expected_beats - 1))
+                begin
+                    `uvm_error("WR_MON_WLAST", $sformatf("ID=%0d beat=%0d expected WLAST=%0b observed WLAST=%0b", aw_tr.wr_addr_channel.id, i, (i == expected_beats - 1), aw_tr.wr_data_channel[i].last))
+                end
+            end
+
+            id = aw_tr.wr_addr_channel.id;
+            pending_write_by_id[id].push_back(aw_tr);
+        end
+
+    endtask
+
+    task capture_b();
+
+        seq_item tr;
+        int unsigned bid;
+
+        bid = wr_cfg.vif.cb_monitor.BID;
+
+        if (!pending_write_by_id.exists(bid) ||
+            pending_write_by_id[bid].size() == 0)
+        begin
+            `uvm_error("WR_MON_ORPHAN_B", $sformatf("B response received without a completed AW/W transaction: BID=%0d", bid))
+            return;
+        end
+
+        tr = pending_write_by_id[bid].pop_front();
+
+        if (pending_write_by_id[bid].size() == 0)
+        begin
+            pending_write_by_id.delete(bid);
+        end
+
+        tr.wr_resp_channel.id   = bid;
+        tr.wr_resp_channel.resp = axi_resp_e'(wr_cfg.vif.cb_monitor.BRESP);
+        tr.wr_resp_channel.user = wr_cfg.vif.cb_monitor.BUSER;
+
+        w_mn2sb.write(tr);
+
+        `uvm_info("WR_MON_COMPLETE", $sformatf("Write complete: BID=%0d ADDR=0x%08h BEATS=%0d BRESP=%0b", bid, tr.wr_addr_channel.addr, tr.wr_data_channel.size(), tr.wr_resp_channel.resp), UVM_HIGH)
+
+    endtask
+
+    function void check_phase(uvm_phase phase);
+
+        super.check_phase(phase);
+
+        if (aw_pending_q.size() != 0)
+        begin
+            `uvm_error("WR_MON_PENDING_AW", $sformatf("%0d AW transactions have no complete W burst", aw_pending_q.size()))
+        end
+
+        if (w_burst_q.size() != 0 || current_w_beats.size() != 0)
+        begin
+            `uvm_error("WR_MON_PENDING_W", $sformatf("Incomplete/unassociated W data remains: complete_bursts=%0d partial_beats=%0d", w_burst_q.size(), current_w_beats.size()))
+        end
+
+        foreach (pending_write_by_id[id])
+        begin
+            if (pending_write_by_id[id].size() != 0)
+            begin
+                `uvm_error("WR_MON_PENDING_B", $sformatf("BID=%0d has %0d writes waiting for B", id, pending_write_by_id[id].size()))
+            end
+        end
+
+    endfunction
+
+endclass
 
 class wr_agent extends uvm_agent;
   `uvm_component_utils(wr_agent)
@@ -1183,126 +1319,175 @@ class rd_driver extends uvm_driver#(seq_item);
 	endfunction 
 endclass
 
+class rd_monitor_context extends uvm_object;
 
-class rd_monitor extends uvm_monitor;
-  `uvm_component_utils(rd_monitor) 
-    uvm_analysis_port#(seq_item) r_mn2sb;
-	rd_config rd_cfg;
-	
-    function new(string name = "rd_monitor",uvm_component parent);
-            super.new(name,parent);
-			r_mn2sb = new("r_mn2sb",this);
+    `uvm_object_utils(rd_monitor_context)
+
+    seq_item tr;
+    int unsigned beat_count;
+
+    function new(string name = "rd_monitor_context");
+        super.new(name);
     endfunction
-	 
-	function void build_phase(uvm_phase phase);
-	    if(!uvm_config_db#(rd_config)::get(this,"","rd_cfg",rd_cfg))
-		   `uvm_fatal("CONFIG_ERROR","RD_MONITOR :configuration is not working properly")
-	endfunction 
-          
-  task run_phase(uvm_phase phase);
-   seq_item tr;
-   forever
-   begin
 
-      tr = seq_item::type_id::create("tr");
-      collect_rd_addr(tr);
-      collect_rd_data(tr);
-	  r_mn2sb.write(tr);
-
-   end
-   endtask
-   
-  task collect_rd_addr(ref seq_item tr);
-
-  forever 
-  begin
-
-    @(rd_cfg.vif.cb_monitor);
-
-    if (rd_cfg.vif.cb_monitor.ARVALID && rd_cfg.vif.cb_monitor.ARREADY) 
-	  begin
-
-      tr.rd_addr_channel.id     = rd_cfg.vif.cb_monitor.ARID;
-      tr.rd_addr_channel.addr   = rd_cfg.vif.cb_monitor.ARADDR;
-      tr.rd_addr_channel.len    = rd_cfg.vif.cb_monitor.ARLEN;
-      tr.rd_addr_channel.size   = rd_cfg.vif.cb_monitor.ARSIZE;
-      tr.rd_addr_channel.burst  = rd_cfg.vif.cb_monitor.ARBURST;
-      tr.rd_addr_channel.lock   = rd_cfg.vif.cb_monitor.ARLOCK;
-      tr.rd_addr_channel.cache  = rd_cfg.vif.cb_monitor.ARCACHE;
-      tr.rd_addr_channel.prot   = rd_cfg.vif.cb_monitor.ARPROT;
-      tr.rd_addr_channel.qos    = rd_cfg.vif.cb_monitor.ARQOS;
-      tr.rd_addr_channel.region = rd_cfg.vif.cb_monitor.ARREGION;
-      tr.rd_addr_channel.user   = rd_cfg.vif.cb_monitor.ARUSER;
-
-      /*$display(
-        "[%0t] ARVALID=%0b ARREADY=%0b ARADDR=%h ARLEN=%0d ARSIZE=%0d ARBURST=%0d",
-        $time,
-        rd_cfg.vif.cb_monitor.ARVALID,
-        rd_cfg.vif.cb_monitor.ARREADY,
-        rd_cfg.vif.cb_monitor.ARADDR,
-        rd_cfg.vif.cb_monitor.ARLEN,
-        rd_cfg.vif.cb_monitor.ARSIZE,
-        rd_cfg.vif.cb_monitor.ARBURST
-      );*/
-
-      break;
-
-    end
-  end
-
-endtask
-task collect_rd_data(ref seq_item tr);
-
-  int unsigned beat;
-
-  tr.rd_data_channel =
-      new[tr.rd_addr_channel.len + 1];
-
-
-  //while (beat < tr.rd_data_channel.size()) 
-    foreach(tr.rd_data_channel[beat])
-	begin
-
-    @(rd_cfg.vif.cb_monitor);
-
-    if (rd_cfg.vif.cb_monitor.RVALID && rd_cfg.vif.cb_monitor.RREADY) 
-	  begin
-
-      tr.rd_data_channel[beat].id =
-          rd_cfg.vif.cb_monitor.RID;
-
-      tr.rd_data_channel[beat].data =
-          rd_cfg.vif.cb_monitor.RDATA;
-
-      tr.rd_data_channel[beat].resp =
-          axi_resp_e'(rd_cfg.vif.cb_monitor.RRESP);
-
-      tr.rd_data_channel[beat].last =
-          rd_cfg.vif.cb_monitor.RLAST;
-
-      tr.rd_data_channel[beat].user =
-          rd_cfg.vif.cb_monitor.RUSER;
-
-     /* `uvm_info("RD_MON",
-        $sformatf(
-          "Beat=%0d RVALID=%0b RREADY=%0b RID=%0d DATA=%08h LAST=%0b",
-          beat,
-          rd_cfg.vif.cb_monitor.RVALID,
-          rd_cfg.vif.cb_monitor.RREADY,
-          tr.rd_data_channel[beat].id,
-          tr.rd_data_channel[beat].data,
-          tr.rd_data_channel[beat].last
-        ),
-        UVM_LOW
-      )*/
-
-      //beat++;
-    end
-  end
-
-endtask
 endclass
           
+class rd_monitor extends uvm_monitor;
+
+    `uvm_component_utils(rd_monitor)
+
+    uvm_analysis_port #(seq_item) r_mn2sb;
+
+    rd_config rd_cfg;
+
+    rd_monitor_context pending_read_by_id[int unsigned][$];
+
+    function new(string name = "rd_monitor", uvm_component parent);
+        super.new(name, parent);
+        r_mn2sb = new("r_mn2sb", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+
+        super.build_phase(phase);
+
+        if (!uvm_config_db #(rd_config)::get(this, "", "rd_cfg", rd_cfg))
+        begin
+            `uvm_fatal("CONFIG_ERROR", "RD_MONITOR: configuration is not available")
+        end
+
+    endfunction
+
+    task run_phase(uvm_phase phase);
+
+        forever
+        begin
+            @(rd_cfg.vif.cb_monitor);
+
+            if (!rd_cfg.vif.ARESETn)
+            begin
+                pending_read_by_id.delete();
+                continue;
+            end
+            if (rd_cfg.vif.cb_monitor.ARVALID &&
+                rd_cfg.vif.cb_monitor.ARREADY)
+            begin
+                capture_ar();
+            end
+
+            if (rd_cfg.vif.cb_monitor.RVALID &&
+                rd_cfg.vif.cb_monitor.RREADY)
+            begin
+                capture_r();
+            end
+        end
+
+    endtask
+
+    task capture_ar();
+
+        rd_monitor_context ctx;
+        int unsigned id;
+
+        ctx    = rd_monitor_context::type_id::create("ctx");
+        ctx.tr = seq_item::type_id::create("rd_tr");
+
+        ctx.tr.rd_addr_channel.id     = rd_cfg.vif.cb_monitor.ARID;
+        ctx.tr.rd_addr_channel.addr   = rd_cfg.vif.cb_monitor.ARADDR;
+        ctx.tr.rd_addr_channel.len    = rd_cfg.vif.cb_monitor.ARLEN;
+        ctx.tr.rd_addr_channel.size   = rd_cfg.vif.cb_monitor.ARSIZE;
+        ctx.tr.rd_addr_channel.burst  = rd_cfg.vif.cb_monitor.ARBURST;
+        ctx.tr.rd_addr_channel.lock   = rd_cfg.vif.cb_monitor.ARLOCK;
+        ctx.tr.rd_addr_channel.cache  = rd_cfg.vif.cb_monitor.ARCACHE;
+        ctx.tr.rd_addr_channel.prot   = rd_cfg.vif.cb_monitor.ARPROT;
+        ctx.tr.rd_addr_channel.qos    = rd_cfg.vif.cb_monitor.ARQOS;
+        ctx.tr.rd_addr_channel.region = rd_cfg.vif.cb_monitor.ARREGION;
+        ctx.tr.rd_addr_channel.user   = rd_cfg.vif.cb_monitor.ARUSER;
+
+        ctx.tr.rd_data_channel =
+            new[ctx.tr.rd_addr_channel.len + 1];
+
+        ctx.beat_count = 0;
+        id             = ctx.tr.rd_addr_channel.id;
+
+        pending_read_by_id[id].push_back(ctx);
+
+        `uvm_info("RD_MON_AR", $sformatf("AR accepted: ID=%0d ADDR=0x%08h LEN=%0d SIZE=%0d BURST=%0d", ctx.tr.rd_addr_channel.id, ctx.tr.rd_addr_channel.addr, ctx.tr.rd_addr_channel.len, ctx.tr.rd_addr_channel.size, ctx.tr.rd_addr_channel.burst), UVM_HIGH)
+
+    endtask
+
+    task capture_r();
+
+        rd_monitor_context ctx;
+        int unsigned rid;
+        int unsigned beat;
+        int unsigned expected_beats;
+        bit expected_last;
+
+        rid = rd_cfg.vif.cb_monitor.RID;
+
+        if (!pending_read_by_id.exists(rid) ||
+            pending_read_by_id[rid].size() == 0)
+        begin
+            `uvm_error("RD_MON_ORPHAN_R", $sformatf("R beat received without an outstanding AR: RID=%0d", rid))
+            return;
+        end
+        ctx = pending_read_by_id[rid][0];
+
+        beat           = ctx.beat_count;
+        expected_beats = ctx.tr.rd_addr_channel.len + 1;
+        expected_last  = (beat == expected_beats - 1);
+
+        if (beat >= ctx.tr.rd_data_channel.size())
+        begin
+            `uvm_error("RD_MON_EXTRA_BEAT", $sformatf("RID=%0d received more than %0d expected beats", rid, expected_beats))
+            return;
+        end
+
+        ctx.tr.rd_data_channel[beat].id   = rid;
+        ctx.tr.rd_data_channel[beat].data = rd_cfg.vif.cb_monitor.RDATA;
+        ctx.tr.rd_data_channel[beat].resp = axi_resp_e'(rd_cfg.vif.cb_monitor.RRESP);
+        ctx.tr.rd_data_channel[beat].last = rd_cfg.vif.cb_monitor.RLAST;
+        ctx.tr.rd_data_channel[beat].user = rd_cfg.vif.cb_monitor.RUSER;
+
+        if (ctx.tr.rd_data_channel[beat].last != expected_last)
+        begin
+            `uvm_error("RD_MON_RLAST", $sformatf("RID=%0d beat=%0d expected RLAST=%0b observed RLAST=%0b", rid, beat, expected_last, ctx.tr.rd_data_channel[beat].last))
+        end
+
+        ctx.beat_count++;
+
+        if (rd_cfg.vif.cb_monitor.RLAST)
+        begin
+            void'(pending_read_by_id[rid].pop_front());
+
+            if (pending_read_by_id[rid].size() == 0)
+            begin
+                pending_read_by_id.delete(rid);
+            end
+            r_mn2sb.write(ctx.tr);
+
+            `uvm_info("RD_MON_COMPLETE", $sformatf("Read complete: RID=%0d ADDR=0x%08h BEATS=%0d", rid, ctx.tr.rd_addr_channel.addr, ctx.beat_count), UVM_HIGH)
+        end
+
+    endtask
+
+    function void check_phase(uvm_phase phase);
+
+        super.check_phase(phase);
+
+        foreach (pending_read_by_id[id])
+        begin
+            if (pending_read_by_id[id].size() != 0)
+            begin
+                `uvm_error("RD_MON_PENDING_R", $sformatf("RID=%0d has %0d reads without RLAST", id, pending_read_by_id[id].size()))
+            end
+        end
+
+    endfunction
+
+endclass
+
         
 
 
@@ -1358,22 +1543,195 @@ class rd_agent extends uvm_agent;
     endfunction
 				 
    endclass
-  class score_board extends uvm_scoreboard;
-   `uvm_component_utils(score_board)
-    uvm_tlm_analysis_fifo#(seq_item) sb_wr;
-	uvm_tlm_analysis_fifo#(seq_item) sb_rd;
-	logic [(DATA_W/4)-1:0] mem [0:MEM_BYTES-1];
-	function new(string name ="score_board",uvm_component parent);
-	          super.new(name,parent);
-			  sb_wr = new("sb_wr",this);
-			  sb_rd = new("sb_rd",this);
-	endfunction
-	
-	
-  endclass
-  
-  
-  class env extends uvm_env;
+ 
+      
+class score_board extends uvm_scoreboard;
+
+    `uvm_component_utils(score_board)
+
+    uvm_tlm_analysis_fifo #(seq_item) sb_wr;
+    uvm_tlm_analysis_fifo #(seq_item) sb_rd;
+
+    seq_item expected_write[int unsigned][$];
+
+    bit enable_check;
+
+    int unsigned pass_count;
+    int unsigned fail_count;
+
+    function new(string name = "score_board", uvm_component parent);
+        super.new(name, parent);
+        sb_wr = new("sb_wr", this);
+        sb_rd = new("sb_rd", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        if (!uvm_config_db #(bit)::get(this, "", "enable_check", enable_check))
+        begin
+            enable_check = 1'b0;
+        end
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        fork
+            store_write_data();
+            compare_read_data();
+        join
+    endtask
+
+    task store_write_data();
+
+        seq_item wr_tr;
+        int unsigned address;
+
+        forever
+        begin
+            sb_wr.get(wr_tr);
+
+            if (!enable_check)
+            begin
+                continue;
+            end
+
+            address = wr_tr.wr_addr_channel.addr;
+            expected_write[address].push_back(wr_tr);
+        end
+
+    endtask
+
+    task compare_read_data();
+
+        seq_item wr_tr;
+        seq_item rd_tr;
+
+        int unsigned address;
+        int unsigned expected_beats;
+        int unsigned actual_beats;
+
+        int first_bad_beat;
+        int first_bad_lane;
+
+        byte unsigned expected_byte;
+        byte unsigned actual_byte;
+
+        bit mismatch;
+
+        forever
+        begin
+            sb_rd.get(rd_tr);
+
+            if (!enable_check)
+            begin
+                continue;
+            end
+
+            address = rd_tr.rd_addr_channel.addr;
+
+            if (!expected_write.exists(address) || expected_write[address].size() == 0)
+            begin
+                fail_count++;
+                `uvm_error("SB_NO_WRITE", $sformatf("No completed write found for read address 0x%08h", address))
+                continue;
+            end
+
+            wr_tr = expected_write[address].pop_front();
+
+            if (expected_write[address].size() == 0)
+            begin
+                expected_write.delete(address);
+            end
+
+            if (wr_tr.wr_addr_channel.addr != rd_tr.rd_addr_channel.addr || wr_tr.wr_addr_channel.len != rd_tr.rd_addr_channel.len || wr_tr.wr_addr_channel.size != rd_tr.rd_addr_channel.size || wr_tr.wr_addr_channel.burst != rd_tr.rd_addr_channel.burst)
+            begin
+                fail_count++;
+                `uvm_error("SB_CONTROL_MISMATCH", $sformatf("Write and read controls do not match. WADDR=0x%08h RADDR=0x%08h WLEN=%0d RLEN=%0d WSIZE=%0d RSIZE=%0d WBURST=%0d RBURST=%0d", wr_tr.wr_addr_channel.addr, rd_tr.rd_addr_channel.addr, wr_tr.wr_addr_channel.len, rd_tr.rd_addr_channel.len, wr_tr.wr_addr_channel.size, rd_tr.rd_addr_channel.size, wr_tr.wr_addr_channel.burst, rd_tr.rd_addr_channel.burst))
+                continue;
+            end
+
+            expected_beats = wr_tr.wr_addr_channel.len + 1;
+            actual_beats = rd_tr.rd_data_channel.size();
+            mismatch = 1'b0;
+            first_bad_beat = -1;
+            first_bad_lane = -1;
+            expected_byte = '0;
+            actual_byte = '0;
+
+            if (wr_tr.wr_data_channel.size() != expected_beats || actual_beats != expected_beats)
+            begin
+                mismatch = 1'b1;
+            end
+
+            for (int beat = 0; beat < expected_beats; beat++)
+            begin
+                if (beat >= wr_tr.wr_data_channel.size() || beat >= rd_tr.rd_data_channel.size())
+                begin
+                    break;
+                end
+
+                for (int lane = 0; lane < DATA_W/8; lane++)
+                begin
+                    if (wr_tr.wr_data_channel[beat].strb[lane])
+                    begin
+                        if (rd_tr.rd_data_channel[beat].data[8*lane +: 8] !== wr_tr.wr_data_channel[beat].data[8*lane +: 8])
+                        begin
+                            if (!mismatch)
+                            begin
+                                first_bad_beat = beat;
+                                first_bad_lane = lane;
+                                expected_byte = wr_tr.wr_data_channel[beat].data[8*lane +: 8];
+                                actual_byte = rd_tr.rd_data_channel[beat].data[8*lane +: 8];
+                            end
+
+                            mismatch = 1'b1;
+                        end
+                    end
+                end
+            end
+
+            if (mismatch)
+            begin
+                fail_count++;
+                `uvm_error("SB_DATA_MISMATCH", $sformatf("Read-after-write failed at address 0x%08h beat=%0d lane=%0d expected=0x%02h actual=0x%02h", address, first_bad_beat, first_bad_lane, expected_byte, actual_byte))
+            end
+            else
+            begin
+                pass_count++;
+            end
+        end
+
+    endtask
+
+    function void check_phase(uvm_phase phase);
+        super.check_phase(phase);
+
+        if (enable_check)
+        begin
+            foreach (expected_write[address])
+            begin
+                if (expected_write[address].size() != 0)
+                begin
+                    `uvm_error("SB_MISSING_READ", $sformatf("Address 0x%08h has %0d completed writes without matching reads", address, expected_write[address].size()))
+                end
+            end
+        end
+    endfunction
+
+    function void report_phase(uvm_phase phase);
+        super.report_phase(phase);
+
+        if (enable_check)
+        begin
+            `uvm_info("SB_SUMMARY", $sformatf("RD_AFT_WR scoreboard completed: PASS=%0d FAIL=%0d", pass_count, fail_count), UVM_NONE)
+        end
+    endfunction
+
+endclass
+
+    
+   
+class env extends uvm_env;
     `uvm_component_utils(env)
 	 wr_agt_top   wr_ag_tp;
 	 rd_agt_top   rd_ag_tp;
@@ -1457,6 +1815,7 @@ class rd_agent extends uvm_agent;
 		    end
 		   end
 		  uvm_config_db#(env_config)::set(this,"*","env_cfg",env_cfg);
+         uvm_config_db #(bit)::set(this, "en.sb_h", "enable_check", 1'b0);
 		  en    = env::type_id::create("en",this);
 		  wr_sq = wr_seq::type_id::create("wr_sq");
 		  rd_sq = rd_seq::type_id::create("rd_sq");
@@ -1580,7 +1939,7 @@ class fixed_test extends test ;
 		    begin
 		    if(wrap_an_sq != null && en.wr_ag_tp.wr_agt[i].wr_sr != null)
 		       wrap_an_sq.start(en.wr_ag_tp.wr_agt[i].wr_sr);
-              wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done >=48 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done >=48);
+              wait(en.wr_ag_tp.wr_agt[i].wr_drv.no_of_wr_trans_done >=19 && en.wr_ag_tp.wr_agt[i].wr_drv.no_of_rd_trans_done >=19);
             end
 	   phase.drop_objection(this);
 	endtask
@@ -1593,7 +1952,54 @@ class fixed_test extends test ;
     function new(string name = " rd_aft_wr_test",uvm_component parent);
 	         super.new(name,parent);
 	endfunction
-
+     function void build_phase(uvm_phase phase);
+	    wr_cfg                   = new[no_of_wr_agents];
+		rd_cfg                   = new[no_of_rd_agents];
+		env_cfg                  = env_config::type_id::create("env_cfg");
+		env_cfg.wr_cfg           = new[no_of_wr_agents];
+		env_cfg.rd_cfg           = new[no_of_rd_agents];
+		env_cfg.no_of_wr_agents  = no_of_wr_agents;
+		env_cfg.no_of_rd_agents  = no_of_rd_agents;
+		foreach(wr_cfg[i])
+		   begin
+		      wr_cfg[i] = wr_config::type_id::create($sformatf("wr_cfg[%0d]",i));
+			
+			if(!uvm_config_db #(virtual axi_fifo_slave_if)::get(this,"","vif",wr_cfg[i].vif))
+			   `uvm_fatal("CONFIG_ERROR","WR_CONFIG at TEST:configuration is not working properly")
+			else
+			 begin
+			  env_cfg.wr_cfg[i] = wr_cfg[i];
+		     if(i<2)
+			  wr_cfg[i].is_active = UVM_ACTIVE;
+			 else
+		      wr_cfg[i].is_active = UVM_PASSIVE;
+			  
+		      uvm_config_db#(wr_config)::set(this,$sformatf("en.wr_ag_tp.wr_agt[%0d]*",i),"wr_cfg",wr_cfg[i]);
+			 end
+		  end
+		foreach(rd_cfg[i])
+		   begin
+		      rd_cfg[i] = rd_config::type_id::create($sformatf("rd_cfg[%0d]",i));
+			  
+			if(! uvm_config_db #(virtual axi_fifo_slave_if)::get(this,"","vif",rd_cfg[i].vif))
+			  `uvm_fatal("CONFIG_ERROR","RD_CONFIG at TEST:configuration is not working properly")
+			else
+             begin			
+			   env_cfg.rd_cfg[i] = rd_cfg[i];
+			 if(i<2)
+			   rd_cfg[i].is_active = UVM_PASSIVE;
+			 else
+		       rd_cfg[i].is_active = UVM_ACTIVE;
+			  
+			   uvm_config_db#(rd_config)::set(this,$sformatf("en.rd_ag_tp.rd_agt[%0d]*",i),"rd_cfg",rd_cfg[i]);
+		    end
+		   end
+		  uvm_config_db#(env_config)::set(this,"*","env_cfg",env_cfg);
+          uvm_config_db #(bit)::set(this, "en.sb_h", "enable_check", 1'b1);
+		  en    = env::type_id::create("en",this);
+		 // wr_sq = wr_seq::type_id::create("wr_sq");
+		 // rd_sq = rd_seq::type_id::create("rd_sq");
+	 endfunction
 	
     task run_phase(uvm_phase phase);
 	   phase.raise_objection(this);
